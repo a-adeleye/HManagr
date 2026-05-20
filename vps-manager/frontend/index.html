@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VPS Manager</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div id="app">
+    <!-- ───── Sidebar: VPS list ───── -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">
+          <span class="brand-dot"></span>
+          <h1>VPS Manager</h1>
+        </div>
+        <button id="add-vps-btn" class="btn-icon" title="Add VPS">+</button>
+      </div>
+      <ul id="vps-list" class="vps-list">
+        <li class="vps-empty muted">No servers yet. Click + to add one.</li>
+      </ul>
+    </aside>
+
+    <!-- ───── Main panel ───── -->
+    <main class="main">
+      <div id="empty-state" class="empty-state">
+        <div class="empty-inner">
+          <h2>Welcome</h2>
+          <p class="muted">Add a VPS from the sidebar to get started.</p>
+        </div>
+      </div>
+
+      <div id="vps-view" class="vps-view hidden">
+        <header class="topbar">
+          <div class="topbar-left">
+            <h2 id="vps-name"></h2>
+            <span id="vps-host" class="mono muted"></span>
+            <span id="status-pill" class="status-pill disconnected">Disconnected</span>
+          </div>
+          <div class="topbar-right">
+            <button id="connect-btn" class="btn">Connect</button>
+            <button id="disconnect-btn" class="btn btn-secondary hidden">Disconnect</button>
+            <button id="edit-vps-btn" class="btn btn-secondary">Edit</button>
+            <button id="delete-vps-btn" class="btn btn-danger">Delete</button>
+          </div>
+        </header>
+
+        <nav class="tabs">
+          <button data-tab="files" class="tab active">Files</button>
+          <button data-tab="docker" class="tab">Docker</button>
+          <button data-tab="terminal" class="tab">Terminal</button>
+        </nav>
+
+        <!-- Files tab -->
+        <section id="tab-files" class="tab-panel active">
+          <div class="files-toolbar">
+            <button id="files-up" class="btn-icon" title="Up one level">↑</button>
+            <input id="files-path" type="text" class="path-input mono" value="/" />
+            <button id="files-go" class="btn btn-secondary">Go</button>
+            <button id="files-refresh" class="btn btn-secondary">Refresh</button>
+            <button id="files-upload" class="btn">Upload</button>
+          </div>
+          <div id="files-list" class="files-list">
+            <p class="muted center-msg">Connect to browse files.</p>
+          </div>
+        </section>
+
+        <!-- Docker tab -->
+        <section id="tab-docker" class="tab-panel">
+          <div class="docker-toolbar">
+            <button id="docker-refresh" class="btn btn-secondary">Refresh</button>
+          </div>
+          <div id="docker-list" class="docker-list">
+            <p class="muted center-msg">Connect to view containers.</p>
+          </div>
+        </section>
+
+        <!-- Terminal tab -->
+        <section id="tab-terminal" class="tab-panel">
+          <div id="terminal-output" class="terminal-output"></div>
+          <div class="terminal-input">
+            <span class="prompt mono">$</span>
+            <input id="cmd-input" type="text" class="mono" placeholder="Type a command and press Enter" autocomplete="off" spellcheck="false" />
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <!-- ───── Modal: add / edit VPS ───── -->
+  <div id="vps-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3 id="modal-title">Add VPS</h3>
+      <form id="vps-form" autocomplete="off">
+        <label>Name<input type="text" name="name" required placeholder="prod-web-1" /></label>
+        <label>Host<input type="text" name="host" required placeholder="192.168.1.100 or example.com" /></label>
+        <div class="row">
+          <label>Port<input type="number" name="port" value="22" min="1" max="65535" /></label>
+          <label>User<input type="text" name="user" required placeholder="root" /></label>
+        </div>
+        <label>Authentication
+          <select name="authType">
+            <option value="key">SSH Key</option>
+            <option value="password">Password</option>
+          </select>
+        </label>
+        <label id="key-field">SSH Key Path
+          <input type="text" name="keyPath" placeholder="~/.ssh/id_rsa" />
+        </label>
+        <label id="password-field" class="hidden">Password
+          <input type="password" name="password" />
+        </label>
+        <input type="hidden" name="id" />
+        <div class="modal-actions">
+          <button type="button" id="modal-cancel" class="btn btn-secondary">Cancel</button>
+          <button type="submit" class="btn">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
