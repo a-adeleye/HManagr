@@ -7,6 +7,7 @@ import {
   ListVPS, AddVPS, UpdateVPS, DeleteVPS,
   Connect, Disconnect, IsConnected,
   ListFiles, DownloadFile, UploadFile, DeleteRemoteFile, DefaultDownloadDir,
+  ReadRemoteFile, WriteRemoteFile,
   ListContainers, RestartContainer, StopContainer, StartContainer, ContainerLogs,
   RunCommand,
 } from '../wailsjs/go/main/App'
@@ -22,6 +23,7 @@ const state = {
   tab: 'files',
   history: [],
   historyIdx: 0,
+  editorPath: null,
 }
 
 // ─────────── Helpers ───────────
@@ -194,6 +196,11 @@ function renderFiles(files) {
 
     const actions = row.querySelector('.actions')
     if (!f.isDir) {
+      const ed = document.createElement('button')
+      ed.textContent = 'Edit'
+      ed.onclick = (e) => { e.stopPropagation(); openEditor(f.path) }
+      actions.appendChild(ed)
+
       const dl = document.createElement('button')
       dl.textContent = 'Download'
       dl.onclick = (e) => { e.stopPropagation(); downloadFile(f.path, f.name) }
@@ -257,6 +264,49 @@ function goUp() {
   const parts = dir.replace(/\/$/, '').split('/')
   parts.pop()
   loadFiles(parts.join('/') || '/')
+}
+
+// ─────────── File editor ───────────
+async function openEditor(remotePath) {
+  const saveBtn = $('editor-save')
+  $('editor-filename').textContent = remotePath
+  $('editor-textarea').value = 'Loading…'
+  $('editor-textarea').disabled = true
+  saveBtn.disabled = true
+  state.editorPath = remotePath
+  $('editor-modal').classList.remove('hidden')
+  try {
+    const content = await ReadRemoteFile(state.selectedId, remotePath)
+    $('editor-textarea').value = content
+    $('editor-textarea').disabled = false
+    saveBtn.disabled = false
+    $('editor-textarea').focus()
+  } catch (e) {
+    alert('Cannot open file: ' + errMsg(e))
+    closeEditor()
+  }
+}
+
+function closeEditor() {
+  $('editor-modal').classList.add('hidden')
+  state.editorPath = null
+}
+
+async function saveEditor() {
+  if (!state.editorPath) return
+  const saveBtn = $('editor-save')
+  saveBtn.textContent = 'Saving…'
+  saveBtn.disabled = true
+  try {
+    await WriteRemoteFile(state.selectedId, state.editorPath, $('editor-textarea').value)
+    closeEditor()
+    loadFiles(state.currentDir)
+  } catch (e) {
+    alert('Save failed: ' + errMsg(e))
+  } finally {
+    saveBtn.textContent = 'Save'
+    saveBtn.disabled = false
+  }
 }
 
 // ─────────── Docker ───────────
@@ -456,6 +506,14 @@ document.addEventListener('DOMContentLoaded', () => {
   // Tabs
   document.querySelectorAll('.tab').forEach((t) => {
     t.addEventListener('click', () => switchTab(t.dataset.tab))
+  })
+
+  // Editor
+  $('editor-cancel').addEventListener('click', closeEditor)
+  $('editor-save').addEventListener('click', saveEditor)
+  $('editor-modal').addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeEditor()
+    if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); saveEditor() }
   })
 
   // Files

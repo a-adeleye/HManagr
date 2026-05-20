@@ -546,6 +546,42 @@ input, button, select { font-family: inherit; user-select: text; }
   margin-top: 8px;
 }
 
+/* ───────── File editor modal ───────── */
+.editor-modal-content {
+  width: 800px;
+  max-width: 92vw;
+  height: 80vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+}
+.editor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.editor-actions {
+  display: flex;
+  gap: 8px;
+}
+.editor-textarea {
+  flex: 1;
+  background: #050709;
+  border: none;
+  color: var(--text);
+  padding: 16px 20px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  resize: none;
+  outline: none;
+  tab-size: 4;
+  user-select: text;
+  border-radius: 0 0 8px 8px;
+}
+
 /* Custom scrollbar */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }

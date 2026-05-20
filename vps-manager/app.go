@@ -113,6 +113,22 @@ func (a *App) UploadFile(id, localPath, remotePath string) error {
 	return sftp.Upload(conn.Client, localPath, remotePath)
 }
 
+func (a *App) ReadRemoteFile(id, remotePath string) (string, error) {
+	conn, err := a.pool.Get(id)
+	if err != nil {
+		return "", err
+	}
+	return sftp.ReadFile(conn.Client, remotePath)
+}
+
+func (a *App) WriteRemoteFile(id, remotePath, content string) error {
+	conn, err := a.pool.Get(id)
+	if err != nil {
+		return err
+	}
+	return sftp.WriteFile(conn.Client, remotePath, content)
+}
+
 func (a *App) DeleteRemoteFile(id, path string) error {
 	conn, err := a.pool.Get(id)
 	if err != nil {

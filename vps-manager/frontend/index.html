@@ -122,6 +122,20 @@
     </div>
   </div>
 
+  <!-- ───── Modal: file editor ───── -->
+  <div id="editor-modal" class="modal hidden">
+    <div class="modal-content editor-modal-content">
+      <div class="editor-header">
+        <span id="editor-filename" class="mono muted"></span>
+        <div class="editor-actions">
+          <button id="editor-cancel" class="btn btn-secondary">Cancel</button>
+          <button id="editor-save" class="btn">Save</button>
+        </div>
+      </div>
+      <textarea id="editor-textarea" class="editor-textarea mono" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"></textarea>
+    </div>
+  </div>
+
   <script type="module" src="/src/main.js"></script>
 </body>
 </html>

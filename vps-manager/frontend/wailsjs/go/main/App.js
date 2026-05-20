@@ -22,6 +22,14 @@ export function DeleteRemoteFile(arg1, arg2) {
   return window['go']['main']['App']['DeleteRemoteFile'](arg1, arg2);
 }
 
+export function ReadRemoteFile(arg1, arg2) {
+  return window['go']['main']['App']['ReadRemoteFile'](arg1, arg2);
+}
+
+export function WriteRemoteFile(arg1, arg2, arg3) {
+  return window['go']['main']['App']['WriteRemoteFile'](arg1, arg2, arg3);
+}
+
 export function DeleteVPS(arg1) {
   return window['go']['main']['App']['DeleteVPS'](arg1);
 }

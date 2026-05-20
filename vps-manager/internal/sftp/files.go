@@ -105,6 +105,53 @@ func Upload(sshClient *ssh.Client, localPath, remotePath string) error {
 	return nil
 }
 
+const maxEditBytes = 512 * 1024 // 512 KB
+
+func ReadFile(sshClient *ssh.Client, remotePath string) (string, error) {
+	c, err := newClient(sshClient)
+	if err != nil {
+		return "", err
+	}
+	defer c.Close()
+
+	info, err := c.Stat(remotePath)
+	if err != nil {
+		return "", fmt.Errorf("stat: %w", err)
+	}
+	if info.Size() > maxEditBytes {
+		return "", fmt.Errorf("file is too large to edit in-app (%.1f MB); use Download instead", float64(info.Size())/1024/1024)
+	}
+
+	f, err := c.Open(remotePath)
+	if err != nil {
+		return "", fmt.Errorf("open: %w", err)
+	}
+	defer f.Close()
+
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return "", fmt.Errorf("read: %w", err)
+	}
+	return string(b), nil
+}
+
+func WriteFile(sshClient *ssh.Client, remotePath, content string) error {
+	c, err := newClient(sshClient)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	f, err := c.Create(remotePath)
+	if err != nil {
+		return fmt.Errorf("create: %w", err)
+	}
+	defer f.Close()
+
+	_, err = f.Write([]byte(content))
+	return err
+}
+
 // Delete removes a file or empty directory. Use with care.
 func Delete(sshClient *ssh.Client, p string) error {
 	c, err := newClient(sshClient)
