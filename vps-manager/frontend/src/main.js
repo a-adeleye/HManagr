@@ -8,10 +8,8 @@ import {
   Connect, Disconnect, IsConnected,
   ListFiles, DownloadFile, UploadFile, DeleteRemoteFile, DefaultDownloadDir,
   ListContainers, RestartContainer, StopContainer, StartContainer, ContainerLogs,
-  RunCommand,
+  RunCommand, ChooseSavePath, ChooseOpenPath,
 } from '../wailsjs/go/main/App'
-
-import { OpenFileDialog, SaveFileDialog } from '../wailsjs/runtime/runtime'
 
 // ─────────── State ───────────
 const state = {
@@ -214,11 +212,7 @@ function renderFiles(files) {
 async function downloadFile(remotePath, name) {
   try {
     const defaultDir = await DefaultDownloadDir()
-    const localPath = await SaveFileDialog({
-      DefaultDirectory: defaultDir,
-      DefaultFilename: name,
-      Title: 'Save file as',
-    })
+    const localPath = await ChooseSavePath(defaultDir, name)
     if (!localPath) return
     await DownloadFile(state.selectedId, remotePath, localPath)
   } catch (e) {
@@ -228,9 +222,7 @@ async function downloadFile(remotePath, name) {
 
 async function uploadFile() {
   try {
-    const localPath = await OpenFileDialog({
-      Title: 'Select file to upload',
-    })
+    const localPath = await ChooseOpenPath()
     if (!localPath) return
     const filename = localPath.split(/[\\/]/).pop()
     const dir = state.currentDir.endsWith('/') ? state.currentDir : state.currentDir + '/'
@@ -341,8 +333,18 @@ async function showLogs(id, name) {
 }
 
 // ─────────── Terminal ───────────
+const PTY_CMD_RE = /^(nano|vi|vim|nvim|emacs|less|more|top|htop|man|watch|lynx|w3m|mysql|psql|sqlite3|python[23]?|ipython|node|irb|pry|ssh|telnet|ftp|sftp)\b/
+
 async function runCmd(cmd) {
   appendOutput(`$ ${cmd}`, 'cmd')
+  if (PTY_CMD_RE.test(cmd.trim())) {
+    appendOutput(
+      'error: interactive commands require a TTY and are not supported in this terminal.\n' +
+      'Tip: use "cat <file>" to view files, or use the Files tab to download and edit them.',
+      'err'
+    )
+    return
+  }
   try {
     const res = await RunCommand(state.selectedId, cmd)
     if (res.stdout) appendOutput(res.stdout)

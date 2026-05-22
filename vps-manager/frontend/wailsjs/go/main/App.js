@@ -6,6 +6,14 @@ export function AddVPS(arg1) {
   return window['go']['main']['App']['AddVPS'](arg1);
 }
 
+export function ChooseOpenPath() {
+  return window['go']['main']['App']['ChooseOpenPath']();
+}
+
+export function ChooseSavePath(arg1, arg2) {
+  return window['go']['main']['App']['ChooseSavePath'](arg1, arg2);
+}
+
 export function Connect(arg1) {
   return window['go']['main']['App']['Connect'](arg1);
 }
