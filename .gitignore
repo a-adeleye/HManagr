@@ -1,1 +1,4 @@
 vps-manager/frontend/node_modules/
+# Build artifact: copied from build/windows/ by the build step so `go build` links the icon
+vps-manager/app_windows.syso
+*.exe~

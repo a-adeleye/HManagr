@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git fetch *)",
+      "Bash(git merge *)",
+      "Bash(go build *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(git push *)",
+      "Bash(go env *)",
+      "Bash(ls \"$\\(go env GOPATH\\)/bin\")",
+      "Bash(go version *)",
+      "PowerShell(Set-Location 'C:\\\\Users\\\\adele\\\\Dev\\\\HManagr\\\\vps-manager'; go build -tags \"production\" -ldflags=\"-w -s -H windowsgui\" -o vps-manager-windows-amd64.exe .; \"exit code: $LASTEXITCODE\")",
+      "PowerShell(Get-Item 'C:\\\\Users\\\\adele\\\\Dev\\\\HManagr\\\\vps-manager\\\\vps-manager-windows-amd64.exe' | Select-Object Name, @{N='SizeMB';E={[math]::Round\\($_.Length/1MB,1\\)}}, LastWriteTime)",
+      "PowerShell($f = Get-Item 'C:\\\\Users\\\\adele\\\\Dev\\\\HManagr\\\\vps-manager\\\\vps-manager-windows-amd64.exe'; Write-Output \\(\"{0}  {1:N1} MB  {2}\" -f $f.Name, \\($f.Length/1MB\\), $f.LastWriteTime\\))",
+      "Read(//c/Users/adele/go/pkg/mod/github.com/wailsapp/wails/v2@v2.9.2/internal/frontend/desktop/windows/winc/**)",
+      "Read(//c/Users/adele/go/pkg/mod/github.com/wailsapp/wails/v2@v2.9.2/internal/frontend/desktop/windows/**)",
+      "Bash(sed -n '28,100p' \"C:/Users/adele/go/pkg/mod/github.com/akavel/rsrc@v0.10.2/rsrc/rsrc.go\")",
+      "Read(//c/Users/adele/go/pkg/mod/github.com/akavel/rsrc@v0.10.2/rsrc/**)",
+      "Bash(WAILS=\"C:/Users/adele/go/pkg/mod/github.com/wailsapp/wails/v2@v2.9.2\" *)",
+      "Read(//c/Users/adele/go/pkg/mod/github.com/wailsapp/wails/v2@v2.9.2/pkg/**)"
+    ]
+  }
+}

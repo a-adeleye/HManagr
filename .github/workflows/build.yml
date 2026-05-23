@@ -34,6 +34,10 @@ jobs:
         run: npm run build
         working-directory: vps-manager/frontend
 
+      - name: Stage Windows icon resource
+        run: copy build\windows\app_windows.syso app_windows.syso
+        shell: cmd
+
       - name: Build
         run: go build -tags "production" -ldflags="-w -s -H windowsgui" -o vps-manager-windows-amd64.exe .
 
