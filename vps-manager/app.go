@@ -11,6 +11,8 @@ import (
 	"vps-manager/internal/docker"
 	"vps-manager/internal/sftp"
 	sshpkg "vps-manager/internal/ssh"
+
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // App is the struct bound to the frontend. Every exported method is callable
@@ -146,6 +148,22 @@ func (a *App) DefaultDownloadDir() (string, error) {
 	dir := filepath.Join(home, "Downloads")
 	_ = os.MkdirAll(dir, 0755)
 	return dir, nil
+}
+
+// ChooseSavePath opens a native save-file dialog and returns the chosen path.
+func (a *App) ChooseSavePath(defaultDir, defaultFilename string) (string, error) {
+	return wailsruntime.SaveFileDialog(a.ctx, wailsruntime.SaveDialogOptions{
+		DefaultDirectory: defaultDir,
+		DefaultFilename:  defaultFilename,
+		Title:            "Save file as",
+	})
+}
+
+// ChooseOpenPath opens a native open-file dialog and returns the chosen path.
+func (a *App) ChooseOpenPath() (string, error) {
+	return wailsruntime.OpenFileDialog(a.ctx, wailsruntime.OpenDialogOptions{
+		Title: "Select file to upload",
+	})
 }
 
 // ───────── Docker ─────────
