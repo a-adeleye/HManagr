@@ -93,3 +93,27 @@ export function UpdateVPS(arg1) {
 export function UploadFile(arg1, arg2, arg3) {
   return window['go']['main']['App']['UploadFile'](arg1, arg2, arg3);
 }
+
+export function StartShell(arg1, arg2, arg3) {
+  return window['go']['main']['App']['StartShell'](arg1, arg2, arg3);
+}
+
+export function WriteShell(arg1, arg2) {
+  return window['go']['main']['App']['WriteShell'](arg1, arg2);
+}
+
+export function ResizeShell(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ResizeShell'](arg1, arg2, arg3);
+}
+
+export function CloseShell(arg1) {
+  return window['go']['main']['App']['CloseShell'](arg1);
+}
+
+export function ClipboardText() {
+  return window['go']['main']['App']['ClipboardText']();
+}
+
+export function SetClipboardText(arg1) {
+  return window['go']['main']['App']['SetClipboardText'](arg1);
+}

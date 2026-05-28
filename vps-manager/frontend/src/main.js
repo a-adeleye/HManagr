@@ -2,6 +2,9 @@
 // / `wails build`, so if you see "Cannot find module" errors, run `wails dev` once
 // (or `wails generate module`) to create them.
 import './style.css'
+import '@xterm/xterm/css/xterm.css'
+import { Terminal } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
 
 import {
   ListVPS, AddVPS, UpdateVPS, DeleteVPS,
@@ -9,8 +12,10 @@ import {
   ListFiles, DownloadFile, UploadFile, DeleteRemoteFile, DefaultDownloadDir,
   ReadRemoteFile, WriteRemoteFile,
   ListContainers, RestartContainer, StopContainer, StartContainer, ContainerLogs,
-  RunCommand, ChooseSavePath, ChooseOpenPath,
+  StartShell, WriteShell, ResizeShell, CloseShell,
+  ClipboardText, SetClipboardText, ChooseSavePath, ChooseOpenPath,
 } from '../wailsjs/go/main/App'
+import { EventsOn } from '../wailsjs/runtime/runtime'
 
 // ─────────── State ───────────
 const state = {
@@ -19,9 +24,16 @@ const state = {
   currentDir: '/',
   connected: false,
   tab: 'files',
-  history: [],
-  historyIdx: 0,
   editorPath: null,
+}
+
+// Interactive terminal (xterm.js) bound to a single PTY shell at a time.
+const term = {
+  inst: null,        // Terminal instance (created lazily)
+  fit: null,         // FitAddon
+  vpsId: null,       // VPS whose shell is currently attached
+  offOutput: null,   // EventsOn cancel fn for shell:output
+  offExit: null,     // EventsOn cancel fn for shell:exit
 }
 
 // ─────────── Helpers ───────────
@@ -91,6 +103,7 @@ async function selectVPS(id) {
   } else {
     $('files-list').innerHTML = '<p class="muted center-msg">Connect to browse files.</p>'
     $('docker-list').innerHTML = '<p class="muted center-msg">Connect to view containers.</p>'
+    resetTerminalPanel()
   }
 }
 
@@ -135,10 +148,19 @@ async function doConnect() {
 
 async function doDisconnect() {
   if (!state.selectedId) return
+  await detachShell()
+  resetTerminalPanel()
   try { await Disconnect(state.selectedId) } catch {}
   state.connected = false
   updateStatusUI()
   renderVPSList()
+}
+
+// Restore the terminal panel to its disconnected state.
+function resetTerminalPanel() {
+  if (term.inst) term.inst.reset()
+  $('terminal').classList.add('hidden')
+  $('terminal-placeholder').classList.remove('hidden')
 }
 
 function loadCurrentTab() {
@@ -149,6 +171,8 @@ function loadCurrentTab() {
     loadFiles(state.currentDir)
   } else if (state.tab === 'docker') {
     loadContainers()
+  } else if (state.tab === 'terminal') {
+    openShell()
   }
 }
 
@@ -374,48 +398,174 @@ async function containerAction(fn, id) {
 async function showLogs(id, name) {
   try {
     const logs = await ContainerLogs(state.selectedId, id, 200)
-    switchTab('terminal')
-    appendOutput(`--- logs ${name} (last 200 lines) ---`, 'info')
-    appendOutput(logs)
+    // Logs are a read-only view: stop any interactive shell so keystrokes
+    // don't leak into it, then switch to the terminal panel without
+    // auto-starting a new shell.
+    await detachShell()
+    setActiveTab('terminal')
+    termPrint(`\x1b[2m--- logs ${name} (last 200 lines) ---\x1b[0m\r\n`)
+    termPrint(logs.endsWith('\n') ? logs : logs + '\n')
+    fitTerm()
   } catch (e) {
     alert('Logs failed: ' + errMsg(e))
   }
 }
 
-// ─────────── Terminal ───────────
-const PTY_CMD_RE = /^(nano|vi|vim|nvim|emacs|less|more|top|htop|man|watch|lynx|w3m|mysql|psql|sqlite3|python[23]?|ipython|node|irb|pry|ssh|telnet|ftp|sftp)\b/
+// ─────────── Terminal (interactive PTY shell over xterm.js) ───────────
 
-async function runCmd(cmd) {
-  appendOutput(`$ ${cmd}`, 'cmd')
-  if (PTY_CMD_RE.test(cmd.trim())) {
-    appendOutput(
-      'error: interactive commands require a TTY and are not supported in this terminal.\n' +
-      'Tip: use "cat <file>" to view files, or use the Files tab to download and edit them.',
-      'err'
-    )
-    return
-  }
+// Decode a base64 chunk from the backend back into the raw bytes xterm expects.
+// PTY output is base64-encoded on the wire so non-UTF-8 / split sequences
+// survive the JSON event transport intact.
+function b64ToBytes(b64) {
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+
+// Create the xterm instance once and mount it. Keystrokes are forwarded to
+// whichever shell is currently attached (term.vpsId).
+function ensureTerm() {
+  if (term.inst) return
+  term.inst = new Terminal({
+    fontFamily: 'var(--mono), Menlo, Consolas, monospace',
+    fontSize: 13,
+    cursorBlink: true,
+    scrollback: 5000,
+    theme: { background: '#050709', foreground: '#d4d7dd', cursor: '#4f9cf9' },
+  })
+  term.fit = new FitAddon()
+  term.inst.loadAddon(term.fit)
+  term.inst.open($('terminal'))
+  term.inst.onData((d) => {
+    if (term.vpsId) WriteShell(term.vpsId, d).catch(() => {})
+  })
+
+  // Clipboard: the WebView doesn't deliver native paste to xterm, so wire it
+  // explicitly through Wails' clipboard. Conventions follow Windows Terminal:
+  //   Ctrl+V / Ctrl+Shift+V  → paste
+  //   Ctrl+Shift+C           → copy selection
+  //   Ctrl+C                 → copy if text is selected, else interrupt (^C)
+  term.inst.attachCustomKeyEventHandler((e) => {
+    if (e.type !== 'keydown') return true
+    const ctrl = e.ctrlKey || e.metaKey
+    if (!ctrl) return true
+    const key = e.key.toLowerCase()
+    if (key === 'v') {
+      pasteIntoShell()
+      return false
+    }
+    if (key === 'c') {
+      const sel = term.inst.getSelection()
+      if (sel && sel.length > 0) {
+        copySelection(sel)
+        return false
+      }
+      // No selection → fall through so Ctrl+C reaches the shell as interrupt.
+    }
+    return true
+  })
+
+  // Right-click: copy a selection if there is one, otherwise paste.
+  $('terminal').addEventListener('contextmenu', (e) => {
+    e.preventDefault()
+    const sel = term.inst.getSelection()
+    if (sel && sel.length > 0) copySelection(sel)
+    else pasteIntoShell()
+  })
+}
+
+async function pasteIntoShell() {
+  if (!term.vpsId) return
   try {
-    const res = await RunCommand(state.selectedId, cmd)
-    if (res.stdout) appendOutput(res.stdout)
-    if (res.stderr) appendOutput(res.stderr, 'err')
-    if (res.exitCode !== 0) appendOutput(`[exit ${res.exitCode}]`, 'info')
-  } catch (e) {
-    appendOutput('error: ' + errMsg(e), 'err')
+    const text = await ClipboardText()
+    if (text) WriteShell(term.vpsId, text).catch(() => {})
+  } catch {}
+}
+
+function copySelection(sel) {
+  SetClipboardText(sel).catch(() => {})
+  term.inst.clearSelection()
+}
+
+// Recompute size to fill the panel, then tell the remote PTY about it.
+function fitTerm() {
+  if (!term.inst || !term.fit) return
+  try {
+    term.fit.fit()
+  } catch { return }
+  if (term.vpsId) {
+    const { cols, rows } = term.inst
+    ResizeShell(term.vpsId, cols, rows).catch(() => {})
   }
 }
 
-function appendOutput(text, cls = '') {
-  const out = $('terminal-output')
-  const div = document.createElement('div')
-  if (cls) div.className = cls
-  div.textContent = text
-  out.appendChild(div)
-  out.scrollTop = out.scrollHeight
+// Open (or re-open) an interactive shell for the selected VPS and stream it
+// into the terminal. Called when the Terminal tab is shown while connected.
+async function openShell() {
+  if (!state.connected || !state.selectedId) return
+  // Reveal the container before mounting so xterm/FitAddon measure real
+  // dimensions rather than a display:none box.
+  $('terminal-placeholder').classList.add('hidden')
+  $('terminal').classList.remove('hidden')
+  ensureTerm()
+
+  // Already attached to this VPS's shell — just refit and focus.
+  if (term.vpsId === state.selectedId) {
+    fitTerm()
+    term.inst.focus()
+    return
+  }
+
+  await detachShell()
+  const id = state.selectedId
+  term.vpsId = id
+  term.inst.reset()
+
+  term.offOutput = EventsOn('shell:output:' + id, (data) => {
+    term.inst.write(b64ToBytes(data))
+  })
+  term.offExit = EventsOn('shell:exit:' + id, () => {
+    term.inst.write('\r\n\x1b[33m[session closed]\x1b[0m\r\n')
+    if (term.vpsId === id) term.vpsId = null
+  })
+
+  try {
+    term.fit.fit()
+    const { cols, rows } = term.inst
+    await StartShell(id, cols, rows)
+    term.inst.focus()
+  } catch (e) {
+    term.inst.write('\r\n\x1b[31mFailed to open shell: ' + errMsg(e) + '\x1b[0m\r\n')
+    await detachShell()
+  }
+}
+
+// Tear down event subscriptions and the remote shell for the attached VPS.
+async function detachShell() {
+  if (term.offOutput) { term.offOutput(); term.offOutput = null }
+  if (term.offExit) { term.offExit(); term.offExit = null }
+  const id = term.vpsId
+  term.vpsId = null
+  if (id) {
+    try { await CloseShell(id) } catch {}
+  }
+}
+
+// Print arbitrary text into the terminal view (used by the container-logs
+// shortcut). Normalizes line endings for the raw terminal.
+function termPrint(text) {
+  ensureTerm()
+  $('terminal-placeholder').classList.add('hidden')
+  $('terminal').classList.remove('hidden')
+  term.inst.write(text.replace(/\r?\n/g, '\r\n'))
 }
 
 // ─────────── Tabs ───────────
-function switchTab(name) {
+// setActiveTab handles only the visual switch; switchTab also loads the tab's
+// content. They're separate so the logs view can show the terminal panel
+// without triggering an interactive shell.
+function setActiveTab(name) {
   state.tab = name
   document.querySelectorAll('.tab').forEach((t) =>
     t.classList.toggle('active', t.dataset.tab === name)
@@ -423,6 +573,10 @@ function switchTab(name) {
   document.querySelectorAll('.tab-panel').forEach((p) =>
     p.classList.toggle('active', p.id === 'tab-' + name)
   )
+}
+
+function switchTab(name) {
+  setActiveTab(name)
   loadCurrentTab()
 }
 
@@ -530,24 +684,11 @@ document.addEventListener('DOMContentLoaded', () => {
   // Docker
   $('docker-refresh').addEventListener('click', loadContainers)
 
-  // Terminal
-  $('cmd-input').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      const cmd = e.target.value.trim()
-      if (!cmd) return
-      state.history.push(cmd)
-      state.historyIdx = state.history.length
-      e.target.value = ''
-      runCmd(cmd)
-    } else if (e.key === 'ArrowUp') {
-      if (state.history.length === 0) return
-      state.historyIdx = Math.max(0, state.historyIdx - 1)
-      e.target.value = state.history[state.historyIdx] || ''
-      e.preventDefault()
-    } else if (e.key === 'ArrowDown') {
-      state.historyIdx = Math.min(state.history.length, state.historyIdx + 1)
-      e.target.value = state.history[state.historyIdx] || ''
-      e.preventDefault()
-    }
+  // Terminal: keep the PTY size in sync with the panel when the window resizes.
+  let resizeTimer = null
+  window.addEventListener('resize', () => {
+    if (state.tab !== 'terminal') return
+    clearTimeout(resizeTimer)
+    resizeTimer = setTimeout(fitTerm, 120)
   })
 })

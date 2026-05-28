@@ -42,3 +42,15 @@ export function StopContainer(arg1:string,arg2:string):Promise<void>;
 export function UpdateVPS(arg1:config.VPS):Promise<void>;
 
 export function UploadFile(arg1:string,arg2:string,arg3:string):Promise<void>;
+
+export function StartShell(arg1:string,arg2:number,arg3:number):Promise<void>;
+
+export function WriteShell(arg1:string,arg2:string):Promise<void>;
+
+export function ResizeShell(arg1:string,arg2:number,arg3:number):Promise<void>;
+
+export function CloseShell(arg1:string):Promise<void>;
+
+export function ClipboardText():Promise<string>;
+
+export function SetClipboardText(arg1:string):Promise<void>;

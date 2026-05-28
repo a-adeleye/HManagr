@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -183,6 +184,131 @@ func (c *Connection) Exec(ctx context.Context, cmd string) (*ExecResult, error) 
 		}
 		return res, err
 	}
+}
+
+// Session is a live interactive shell backed by a PTY on the remote host.
+// Unlike Exec (one-shot, stateless), a Session is long-lived: the remote shell
+// keeps its working directory, environment, and any foreground program (psql,
+// nano, top, …) alive across writes. Terminal output is streamed to the onData
+// callback as it arrives.
+type Session struct {
+	sess   *ssh.Session
+	stdin  io.WriteCloser
+	mu     sync.Mutex
+	closed bool
+}
+
+// Shell opens an interactive login shell with a PTY of the given size.
+//
+//   - onData is invoked from a background goroutine with chunks of raw terminal
+//     output (merged stdout+stderr) as they arrive. It must not block for long.
+//   - onClose is invoked once, after the remote shell exits and the output
+//     stream drains. It may be nil.
+func (c *Connection) Shell(cols, rows int, onData func([]byte), onClose func()) (*Session, error) {
+	sess, err := c.Client.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("new session: %w", err)
+	}
+
+	if cols <= 0 {
+		cols = 80
+	}
+	if rows <= 0 {
+		rows = 24
+	}
+
+	modes := ssh.TerminalModes{
+		ssh.ECHO:          1,
+		ssh.TTY_OP_ISPEED: 14400,
+		ssh.TTY_OP_OSPEED: 14400,
+	}
+	if err := sess.RequestPty("xterm-256color", rows, cols, modes); err != nil {
+		_ = sess.Close()
+		return nil, fmt.Errorf("request pty: %w", err)
+	}
+
+	stdin, err := sess.StdinPipe()
+	if err != nil {
+		_ = sess.Close()
+		return nil, fmt.Errorf("stdin pipe: %w", err)
+	}
+	// With a PTY, the remote merges stderr onto the terminal, so reading stdout
+	// alone gives us everything the user would see on a real terminal.
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		_ = sess.Close()
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+
+	if err := sess.Shell(); err != nil {
+		_ = sess.Close()
+		return nil, fmt.Errorf("start shell: %w", err)
+	}
+
+	s := &Session{sess: sess, stdin: stdin}
+
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, readErr := stdout.Read(buf)
+			if n > 0 && onData != nil {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				onData(chunk)
+			}
+			if readErr != nil {
+				break
+			}
+		}
+		_ = sess.Wait()
+		s.markClosed()
+		if onClose != nil {
+			onClose()
+		}
+	}()
+
+	return s, nil
+}
+
+// Write sends raw bytes (keystrokes, pasted text, control sequences) to the
+// shell's stdin.
+func (s *Session) Write(p []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return fmt.Errorf("session closed")
+	}
+	_, err := s.stdin.Write(p)
+	return err
+}
+
+// Resize informs the remote PTY of a new terminal size so full-screen programs
+// redraw correctly.
+func (s *Session) Resize(cols, rows int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	return s.sess.WindowChange(rows, cols)
+}
+
+// Close terminates the shell. Safe to call more than once.
+func (s *Session) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	_ = s.stdin.Close()
+	return s.sess.Close()
+}
+
+func (s *Session) markClosed() {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
 }
 
 func expandHome(p string) string {

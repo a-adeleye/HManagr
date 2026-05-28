@@ -17,7 +17,19 @@
       "Bash(sed -n '28,100p' \"C:/Users/adele/go/pkg/mod/github.com/akavel/rsrc@v0.10.2/rsrc/rsrc.go\")",
       "Read(//c/Users/adele/go/pkg/mod/github.com/akavel/rsrc@v0.10.2/rsrc/**)",
       "Bash(WAILS=\"C:/Users/adele/go/pkg/mod/github.com/wailsapp/wails/v2@v2.9.2\" *)",
-      "Read(//c/Users/adele/go/pkg/mod/github.com/wailsapp/wails/v2@v2.9.2/pkg/**)"
+      "Read(//c/Users/adele/go/pkg/mod/github.com/wailsapp/wails/v2@v2.9.2/pkg/**)",
+      "Bash(npm ping *)",
+      "Bash(npm install *)",
+      "Bash(echo \"BUILD_DONE exit=$?\")",
+      "Read(//c/c/Users/adele/Dev/HManagr/vps-manager/frontend/wailsjs/go/**)",
+      "Read(//c/c/Users/adele/Dev/HManagr/vps-manager/frontend/wailsjs/go/main/**)",
+      "Bash(wails version *)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(node -e \"const p=require\\('@xterm/xterm/package.json'\\); console.log\\('xterm', p.version, '| main:', p.main, '| module:', p.module\\);\")",
+      "Bash(node -e \"const p=require\\('@xterm/addon-fit/package.json'\\); console.log\\('fit', p.version, '| module:', p.module\\);\")",
+      "Bash(./build/bin/vps-manager.exe)",
+      "Bash(tasklist)",
+      "Bash(npm run *)"
     ]
   }
 }

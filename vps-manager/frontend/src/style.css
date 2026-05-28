@@ -434,49 +434,20 @@ input, button, select { font-family: inherit; user-select: text; }
 }
 
 /* ───────── Terminal ───────── */
-.terminal-output {
+.terminal {
   flex: 1;
   background: #050709;
-  padding: 16px 20px;
-  font-family: var(--mono);
-  font-size: 12.5px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-all;
-  line-height: 1.55;
-  user-select: text;
+  padding: 8px 8px 8px 12px;
+  overflow: hidden;
+  min-height: 0;
 }
-.terminal-output > div { padding: 1px 0; }
-.terminal-output .cmd {
-  color: var(--accent);
-  font-weight: 500;
-  margin-top: 8px;
+/* xterm fills its container; the .terminal padding gives breathing room. */
+.terminal .xterm,
+.terminal .xterm-viewport,
+.terminal .xterm-screen {
+  height: 100% !important;
 }
-.terminal-output .cmd:first-child { margin-top: 0; }
-.terminal-output .err { color: var(--danger); }
-.terminal-output .info { color: var(--text-muted); font-style: italic; }
-
-.terminal-input {
-  display: flex;
-  align-items: center;
-  padding: 10px 20px;
-  background: #050709;
-  border-top: 1px solid var(--border);
-  gap: 10px;
-}
-.terminal-input .prompt {
-  color: var(--accent);
-  font-weight: 600;
-}
-.terminal-input input {
-  flex: 1;
-  background: transparent;
-  border: none;
-  color: var(--text);
-  font-size: 12.5px;
-  outline: none;
-  caret-color: var(--accent);
-}
+#terminal-placeholder { margin: auto; }
 
 /* ───────── Modal ───────── */
 .modal {
