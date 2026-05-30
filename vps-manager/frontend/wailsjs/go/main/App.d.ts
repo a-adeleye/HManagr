@@ -51,6 +51,8 @@ export function ResizeShell(arg1:string,arg2:number,arg3:number):Promise<void>;
 
 export function CloseShell(arg1:string):Promise<void>;
 
+export function MakeDir(arg1:string,arg2:string):Promise<void>;
+
 export function ClipboardText():Promise<string>;
 
 export function SetClipboardText(arg1:string):Promise<void>;

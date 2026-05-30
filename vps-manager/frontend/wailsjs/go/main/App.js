@@ -110,6 +110,10 @@ export function CloseShell(arg1) {
   return window['go']['main']['App']['CloseShell'](arg1);
 }
 
+export function MakeDir(arg1, arg2) {
+  return window['go']['main']['App']['MakeDir'](arg1, arg2);
+}
+
 export function ClipboardText() {
   return window['go']['main']['App']['ClipboardText']();
 }

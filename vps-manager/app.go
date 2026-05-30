@@ -155,6 +155,15 @@ func (a *App) DeleteRemoteFile(id, path string) error {
 	return sftp.Delete(conn.Client, path)
 }
 
+// MakeDir creates a directory on the remote host (mkdir -p semantics).
+func (a *App) MakeDir(id, path string) error {
+	conn, err := a.pool.Get(id)
+	if err != nil {
+		return err
+	}
+	return sftp.Mkdir(conn.Client, path)
+}
+
 // DefaultDownloadDir returns ~/Downloads for the current user, creating it if needed.
 func (a *App) DefaultDownloadDir() (string, error) {
 	home, err := os.UserHomeDir()

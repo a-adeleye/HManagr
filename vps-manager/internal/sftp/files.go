@@ -153,6 +153,24 @@ func WriteFile(sshClient *ssh.Client, remotePath, content string) error {
 }
 
 // Delete removes a file or empty directory. Use with care.
+// Mkdir creates the directory at p, creating any missing parents (mkdir -p
+// semantics). Returns an error if a non-directory already exists at the path.
+func Mkdir(sshClient *ssh.Client, p string) error {
+	c, err := newClient(sshClient)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	if stat, err := c.Stat(p); err == nil {
+		if stat.IsDir() {
+			return nil
+		}
+		return fmt.Errorf("%s exists and is not a directory", p)
+	}
+	return c.MkdirAll(p)
+}
+
 func Delete(sshClient *ssh.Client, p string) error {
 	c, err := newClient(sshClient)
 	if err != nil {

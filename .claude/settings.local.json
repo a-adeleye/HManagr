@@ -29,7 +29,8 @@
       "Bash(node -e \"const p=require\\('@xterm/addon-fit/package.json'\\); console.log\\('fit', p.version, '| module:', p.module\\);\")",
       "Bash(./build/bin/vps-manager.exe)",
       "Bash(tasklist)",
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(taskkill //IM vps-manager.exe //F)"
     ]
   }
 }

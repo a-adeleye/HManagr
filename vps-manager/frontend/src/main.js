@@ -9,7 +9,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import {
   ListVPS, AddVPS, UpdateVPS, DeleteVPS,
   Connect, Disconnect, IsConnected,
-  ListFiles, DownloadFile, UploadFile, DeleteRemoteFile, DefaultDownloadDir,
+  ListFiles, DownloadFile, UploadFile, DeleteRemoteFile, MakeDir, DefaultDownloadDir,
   ReadRemoteFile, WriteRemoteFile,
   ListContainers, RestartContainer, StopContainer, StartContainer, ContainerLogs,
   StartShell, WriteShell, ResizeShell, CloseShell,
@@ -261,6 +261,25 @@ async function uploadFile() {
     loadFiles(state.currentDir)
   } catch (e) {
     alert('Upload failed: ' + errMsg(e))
+  }
+}
+
+async function createDir() {
+  if (!state.connected) return
+  const name = (prompt('New folder name:') || '').trim()
+  if (!name) return
+  // Reject path separators so users don't accidentally create nested paths
+  // (or absolute ones) when they just want a folder in the current directory.
+  if (/[\\/]/.test(name)) {
+    alert('Folder name cannot contain "/" or "\\".')
+    return
+  }
+  const dir = state.currentDir.endsWith('/') ? state.currentDir : state.currentDir + '/'
+  try {
+    await MakeDir(state.selectedId, dir + name)
+    loadFiles(state.currentDir)
+  } catch (e) {
+    alert('Create folder failed: ' + errMsg(e))
   }
 }
 
@@ -679,6 +698,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('files-path').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') loadFiles(e.target.value)
   })
+  $('files-mkdir').addEventListener('click', createDir)
   $('files-upload').addEventListener('click', uploadFile)
 
   // Docker
