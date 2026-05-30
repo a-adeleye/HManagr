@@ -10,6 +10,7 @@ import {
   ListVPS, AddVPS, UpdateVPS, DeleteVPS,
   Connect, Disconnect, IsConnected,
   ListFiles, DownloadFile, UploadFile, DeleteRemoteFile, MakeDir, DefaultDownloadDir,
+  StatRemoteFile, ChmodRemoteFile, ChownRemoteFile,
   ReadRemoteFile, WriteRemoteFile,
   ListContainers, RestartContainer, StopContainer, StartContainer, ContainerLogs,
   StartShell, WriteShell, ResizeShell, CloseShell,
@@ -228,6 +229,11 @@ function renderFiles(files) {
       dl.onclick = (e) => { e.stopPropagation(); downloadFile(f.path, f.name) }
       actions.appendChild(dl)
     }
+    const perm = document.createElement('button')
+    perm.textContent = 'Perms'
+    perm.onclick = (e) => { e.stopPropagation(); openPermsModal(f.path) }
+    actions.appendChild(perm)
+
     const del = document.createElement('button')
     del.textContent = 'Delete'
     del.onclick = (e) => { e.stopPropagation(); deleteFile(f.path) }
@@ -280,6 +286,53 @@ async function createDir() {
     loadFiles(state.currentDir)
   } catch (e) {
     alert('Create folder failed: ' + errMsg(e))
+  }
+}
+
+// ─────────── Permissions (chmod / chown) ───────────
+// permsTarget holds the path currently being edited so the form submit handler
+// (wired once at startup) knows what to act on.
+let permsTarget = null
+
+async function openPermsModal(path) {
+  if (!state.connected) return
+  permsTarget = path
+  $('perms-path').textContent = path
+  // Show defaults while the stat call is in flight.
+  $('perms-mode').value = ''
+  $('perms-owner').value = ''
+  $('perms-group').value = ''
+  $('perms-modal').classList.remove('hidden')
+  try {
+    const info = await StatRemoteFile(state.selectedId, path)
+    $('perms-mode').value = info.mode
+    $('perms-owner').value = info.owner || String(info.uid)
+    $('perms-group').value = info.group || String(info.gid)
+  } catch (e) {
+    alert('Stat failed: ' + errMsg(e))
+    closePermsModal()
+  }
+}
+
+function closePermsModal() {
+  $('perms-modal').classList.add('hidden')
+  permsTarget = null
+}
+
+async function submitPerms(e) {
+  e.preventDefault()
+  if (!permsTarget) return
+  const path = permsTarget
+  const mode = $('perms-mode').value.trim()
+  const owner = $('perms-owner').value.trim()
+  const group = $('perms-group').value.trim()
+  try {
+    if (mode) await ChmodRemoteFile(state.selectedId, path, mode)
+    if (owner || group) await ChownRemoteFile(state.selectedId, path, owner, group)
+    closePermsModal()
+    loadFiles(state.currentDir)
+  } catch (err) {
+    alert('Update failed: ' + errMsg(err))
   }
 }
 
@@ -682,6 +735,10 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.tab').forEach((t) => {
     t.addEventListener('click', () => switchTab(t.dataset.tab))
   })
+
+  // Permissions modal
+  $('perms-cancel').addEventListener('click', closePermsModal)
+  $('perms-form').addEventListener('submit', submitPerms)
 
   // Editor
   $('editor-cancel').addEventListener('click', closeEditor)

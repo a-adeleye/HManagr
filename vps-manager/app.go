@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -162,6 +164,135 @@ func (a *App) MakeDir(id, path string) error {
 		return err
 	}
 	return sftp.Mkdir(conn.Client, path)
+}
+
+// ───────── Permissions ─────────
+
+// PathInfo is StatRemoteFile's response: mode + numeric owner/group plus
+// resolved owner/group names (best-effort; empty string if lookup fails).
+type PathInfo struct {
+	Mode  string `json:"mode"`
+	UID   int    `json:"uid"`
+	GID   int    `json:"gid"`
+	Owner string `json:"owner"`
+	Group string `json:"group"`
+	IsDir bool   `json:"isDir"`
+}
+
+// StatRemoteFile returns mode/owner info for the permissions modal. Owner and
+// group names are resolved via getent over SSH; if that fails the numeric IDs
+// are still returned.
+func (a *App) StatRemoteFile(id, p string) (*PathInfo, error) {
+	conn, err := a.pool.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	st, err := sftp.Stat(conn.Client, p)
+	if err != nil {
+		return nil, err
+	}
+	info := &PathInfo{Mode: st.Mode, UID: st.UID, GID: st.GID, IsDir: st.IsDir}
+
+	ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
+	defer cancel()
+	if name, err := lookupName(ctx, conn, "passwd", st.UID); err == nil {
+		info.Owner = name
+	}
+	if name, err := lookupName(ctx, conn, "group", st.GID); err == nil {
+		info.Group = name
+	}
+	return info, nil
+}
+
+// ChmodRemoteFile sets the mode on p. mode is parsed as octal (with or without
+// a leading 0), e.g. "755" or "0755".
+func (a *App) ChmodRemoteFile(id, p, mode string) error {
+	conn, err := a.pool.Get(id)
+	if err != nil {
+		return err
+	}
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		return fmt.Errorf("mode is required")
+	}
+	mode = strings.TrimPrefix(mode, "0o")
+	mode = strings.TrimPrefix(mode, "0")
+	if mode == "" {
+		mode = "0"
+	}
+	m, err := strconv.ParseUint(mode, 8, 32)
+	if err != nil {
+		return fmt.Errorf("invalid mode (use octal like 755): %w", err)
+	}
+	return sftp.Chmod(conn.Client, p, os.FileMode(m))
+}
+
+// ChownRemoteFile changes owner and/or group of p. owner and group may be
+// either a name or a numeric id; an empty string leaves that side unchanged.
+func (a *App) ChownRemoteFile(id, p, owner, group string) error {
+	conn, err := a.pool.Get(id)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
+	defer cancel()
+
+	uid, gid := -1, -1
+	if s := strings.TrimSpace(owner); s != "" {
+		v, err := resolveID(ctx, conn, "passwd", s)
+		if err != nil {
+			return fmt.Errorf("owner: %w", err)
+		}
+		uid = v
+	}
+	if s := strings.TrimSpace(group); s != "" {
+		v, err := resolveID(ctx, conn, "group", s)
+		if err != nil {
+			return fmt.Errorf("group: %w", err)
+		}
+		gid = v
+	}
+	if uid < 0 && gid < 0 {
+		return nil
+	}
+	return sftp.Chown(conn.Client, p, uid, gid)
+}
+
+// resolveID maps either a numeric id or a name to a uid (db="passwd") or
+// gid (db="group") via `getent` on the remote host.
+func resolveID(ctx context.Context, conn *sshpkg.Connection, db, nameOrID string) (int, error) {
+	res, err := conn.Exec(ctx, "getent "+db+" "+shellQuote(nameOrID))
+	if err != nil {
+		return 0, err
+	}
+	if res.ExitCode != 0 {
+		return 0, fmt.Errorf("%q not found in %s", nameOrID, db)
+	}
+	// getent passwd: name:x:UID:GID:...
+	// getent group:  name:x:GID:...
+	parts := strings.Split(strings.TrimSpace(res.Stdout), ":")
+	if len(parts) < 3 {
+		return 0, fmt.Errorf("malformed getent output")
+	}
+	return strconv.Atoi(parts[2])
+}
+
+// lookupName is the inverse: numeric id → name via getent.
+func lookupName(ctx context.Context, conn *sshpkg.Connection, db string, id int) (string, error) {
+	res, err := conn.Exec(ctx, fmt.Sprintf("getent %s %d", db, id))
+	if err != nil {
+		return "", err
+	}
+	if res.ExitCode != 0 {
+		return "", fmt.Errorf("not found")
+	}
+	parts := strings.SplitN(strings.TrimSpace(res.Stdout), ":", 2)
+	return parts[0], nil
+}
+
+// shellQuote wraps s in single quotes for safe inclusion in a remote command.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 // DefaultDownloadDir returns ~/Downloads for the current user, creating it if needed.

@@ -30,7 +30,13 @@
       "Bash(./build/bin/vps-manager.exe)",
       "Bash(tasklist)",
       "Bash(npm run *)",
-      "Bash(taskkill //IM vps-manager.exe //F)"
+      "Bash(taskkill //IM vps-manager.exe //F)",
+      "Bash(echo \"GO=$?\")",
+      "Bash(echo \"FE=$?\")",
+      "Read(//c/Users/adele/Dev/**)",
+      "Bash(echo \"EXE=$?\")",
+      "Bash(/c/Users/adele/Dev/HManagr/vps-manager/build/bin/vps-manager.exe)",
+      "Bash(disown)"
     ]
   }
 }

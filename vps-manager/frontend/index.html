@@ -134,6 +134,30 @@
     </div>
   </div>
 
+  <!-- ───── Modal: permissions (chmod / chown) ───── -->
+  <div id="perms-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3>Permissions</h3>
+      <p id="perms-path" class="mono muted" style="word-break:break-all;margin:0 0 12px;"></p>
+      <form id="perms-form" autocomplete="off">
+        <label>Mode (octal)
+          <input type="text" id="perms-mode" name="mode" placeholder="755" pattern="0?[0-7]{3,4}" required />
+        </label>
+        <div class="row">
+          <label>Owner<input type="text" id="perms-owner" name="owner" placeholder="user or uid" /></label>
+          <label>Group<input type="text" id="perms-group" name="group" placeholder="group or gid" /></label>
+        </div>
+        <p class="muted" style="font-size:12px;margin:4px 0 12px;">
+          Changing owner/group usually requires root on the remote.
+        </p>
+        <div class="modal-actions">
+          <button type="button" id="perms-cancel" class="btn btn-secondary">Cancel</button>
+          <button type="submit" class="btn">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <script type="module" src="/src/main.js"></script>
 </body>
 </html>

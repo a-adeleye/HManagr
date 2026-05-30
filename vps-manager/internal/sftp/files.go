@@ -153,6 +153,78 @@ func WriteFile(sshClient *ssh.Client, remotePath, content string) error {
 }
 
 // Delete removes a file or empty directory. Use with care.
+// PathStat is the metadata the permissions UI needs about a path: the four-
+// digit octal mode (perm bits + setuid/setgid/sticky), the numeric owner/group,
+// and whether the path is a directory.
+type PathStat struct {
+	Mode  string `json:"mode"`
+	UID   int    `json:"uid"`
+	GID   int    `json:"gid"`
+	IsDir bool   `json:"isDir"`
+}
+
+// Stat returns mode, uid and gid for p. Names are not resolved here — that
+// requires running a shell command, which is the App layer's job.
+func Stat(sshClient *ssh.Client, p string) (PathStat, error) {
+	c, err := newClient(sshClient)
+	if err != nil {
+		return PathStat{}, err
+	}
+	defer c.Close()
+	info, err := c.Stat(p)
+	if err != nil {
+		return PathStat{}, err
+	}
+	ps := PathStat{
+		Mode:  fmt.Sprintf("%04o", info.Mode().Perm()),
+		IsDir: info.IsDir(),
+	}
+	// Prefer raw sftp.FileStat when available: it carries the setuid/setgid/
+	// sticky bits the os.FileMode permission mask drops, plus uid/gid.
+	if sys, ok := info.Sys().(*sftp.FileStat); ok {
+		ps.Mode = fmt.Sprintf("%04o", sys.Mode&07777)
+		ps.UID = int(sys.UID)
+		ps.GID = int(sys.GID)
+	}
+	return ps, nil
+}
+
+// Chmod changes the permission bits of p. mode is the full mode value
+// including any high bits (setuid/setgid/sticky).
+func Chmod(sshClient *ssh.Client, p string, mode os.FileMode) error {
+	c, err := newClient(sshClient)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	return c.Chmod(p, mode)
+}
+
+// Chown changes the numeric owner/group of p. Use -1 to leave one unchanged.
+func Chown(sshClient *ssh.Client, p string, uid, gid int) error {
+	c, err := newClient(sshClient)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	// pkg/sftp.Chown doesn't accept -1; fetch current to fill missing side.
+	if uid < 0 || gid < 0 {
+		info, err := c.Stat(p)
+		if err != nil {
+			return err
+		}
+		if sys, ok := info.Sys().(*sftp.FileStat); ok {
+			if uid < 0 {
+				uid = int(sys.UID)
+			}
+			if gid < 0 {
+				gid = int(sys.GID)
+			}
+		}
+	}
+	return c.Chown(p, uid, gid)
+}
+
 // Mkdir creates the directory at p, creating any missing parents (mkdir -p
 // semantics). Returns an error if a non-directory already exists at the path.
 func Mkdir(sshClient *ssh.Client, p string) error {

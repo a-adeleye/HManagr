@@ -114,6 +114,18 @@ export function MakeDir(arg1, arg2) {
   return window['go']['main']['App']['MakeDir'](arg1, arg2);
 }
 
+export function StatRemoteFile(arg1, arg2) {
+  return window['go']['main']['App']['StatRemoteFile'](arg1, arg2);
+}
+
+export function ChmodRemoteFile(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ChmodRemoteFile'](arg1, arg2, arg3);
+}
+
+export function ChownRemoteFile(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['ChownRemoteFile'](arg1, arg2, arg3, arg4);
+}
+
 export function ClipboardText() {
   return window['go']['main']['App']['ClipboardText']();
 }

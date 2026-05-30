@@ -53,6 +53,12 @@ export function CloseShell(arg1:string):Promise<void>;
 
 export function MakeDir(arg1:string,arg2:string):Promise<void>;
 
+export function StatRemoteFile(arg1:string,arg2:string):Promise<main.PathInfo>;
+
+export function ChmodRemoteFile(arg1:string,arg2:string,arg3:string):Promise<void>;
+
+export function ChownRemoteFile(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
+
 export function ClipboardText():Promise<string>;
 
 export function SetClipboardText(arg1:string):Promise<void>;
