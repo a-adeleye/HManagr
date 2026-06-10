@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	"vps-manager/internal/config"
 	"vps-manager/internal/docker"
+	"vps-manager/internal/migration"
 	"vps-manager/internal/sftp"
 	sshpkg "vps-manager/internal/ssh"
 
@@ -28,12 +30,18 @@ type App struct {
 
 	shmu   sync.Mutex
 	shells map[string]*sshpkg.Session // interactive shells keyed by VPS ID
+
+	// sudoPasswords is held in process memory only, keyed by VPS ID, and
+	// cleared on Disconnect / DeleteVPS / shutdown. Never persisted.
+	sudoMu        sync.Mutex
+	sudoPasswords map[string]string
 }
 
 func NewApp() *App {
 	return &App{
-		pool:   sshpkg.NewPool(),
-		shells: make(map[string]*sshpkg.Session),
+		pool:          sshpkg.NewPool(),
+		shells:        make(map[string]*sshpkg.Session),
+		sudoPasswords: make(map[string]string),
 	}
 }
 
@@ -54,6 +62,11 @@ func (a *App) shutdown(ctx context.Context) {
 		delete(a.shells, id)
 	}
 	a.shmu.Unlock()
+	a.sudoMu.Lock()
+	for k := range a.sudoPasswords {
+		delete(a.sudoPasswords, k)
+	}
+	a.sudoMu.Unlock()
 	a.pool.Close()
 }
 
@@ -73,6 +86,7 @@ func (a *App) UpdateVPS(v config.VPS) error {
 
 func (a *App) DeleteVPS(id string) error {
 	a.closeShell(id)
+	a.ClearSudoPassword(id)
 	_ = a.pool.Disconnect(id)
 	return a.store.Delete(id)
 }
@@ -97,6 +111,7 @@ func (a *App) Connect(id string) error {
 
 func (a *App) Disconnect(id string) error {
 	a.closeShell(id)
+	a.ClearSudoPassword(id)
 	return a.pool.Disconnect(id)
 }
 
@@ -157,13 +172,165 @@ func (a *App) DeleteRemoteFile(id, path string) error {
 	return sftp.Delete(conn.Client, path)
 }
 
-// MakeDir creates a directory on the remote host (mkdir -p semantics).
-func (a *App) MakeDir(id, path string) error {
+// MakeDir creates a directory on the remote host (mkdir -p semantics). If
+// useSudo is true, the call shells out to `sudo mkdir -p` instead of going
+// through SFTP, since SFTP has no way to elevate.
+func (a *App) MakeDir(id, path string, useSudo bool) error {
+	if useSudo {
+		res, err := a.execAsSudo(id, "mkdir -p "+shellQuote(path))
+		return sudoErr(res, err)
+	}
 	conn, err := a.pool.Get(id)
 	if err != nil {
 		return err
 	}
 	return sftp.Mkdir(conn.Client, path)
+}
+
+// ───────── Sudo ─────────
+//
+// Sudo passwords live in process memory only, keyed by VPS ID. They're cleared
+// on Disconnect / DeleteVPS / shutdown and never persisted. If no password is
+// cached, sudo runs with `-n` (non-interactive) — fine for NOPASSWD setups,
+// fails otherwise with a clear error so the UI can prompt.
+
+func (a *App) SetSudoPassword(id, password string) {
+	a.sudoMu.Lock()
+	defer a.sudoMu.Unlock()
+	a.sudoPasswords[id] = password
+}
+
+func (a *App) HasSudoPassword(id string) bool {
+	a.sudoMu.Lock()
+	defer a.sudoMu.Unlock()
+	_, ok := a.sudoPasswords[id]
+	return ok
+}
+
+func (a *App) ClearSudoPassword(id string) {
+	a.sudoMu.Lock()
+	defer a.sudoMu.Unlock()
+	delete(a.sudoPasswords, id)
+}
+
+// ProbeSudo reports whether sudo on this VPS will work without a password
+// prompt right now. Used by the migration wizard so it can avoid asking for a
+// password when one isn't actually needed (NOPASSWD or already-cached).
+//
+// Returns one of:
+//
+//	"ok"       — sudo runs non-interactively (NOPASSWD or a working cached pw)
+//	"password" — a password is required and we don't have a valid one cached
+//	"denied"   — this user isn't in sudoers at all
+func (a *App) ProbeSudo(id string) (string, error) {
+	conn, err := a.pool.Get(id)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
+	defer cancel()
+
+	a.sudoMu.Lock()
+	pwd, hasPwd := a.sudoPasswords[id]
+	a.sudoMu.Unlock()
+
+	if hasPwd {
+		res, err := conn.ExecWithStdin(ctx, "sudo -S -p '' true", pwd+"\n")
+		if err == nil && res.ExitCode == 0 {
+			return "ok", nil
+		}
+		// Cached password no longer works — fall through to a clean probe so
+		// "denied" can still be distinguished from "password".
+		a.sudoMu.Lock()
+		delete(a.sudoPasswords, id)
+		a.sudoMu.Unlock()
+	}
+
+	res, err := conn.Exec(ctx, "sudo -n true")
+	if err != nil {
+		return "", err
+	}
+	if res.ExitCode == 0 {
+		return "ok", nil
+	}
+	out := strings.ToLower(res.Stdout + " " + res.Stderr)
+	if strings.Contains(out, "not in the sudoers") || strings.Contains(out, "not allowed to execute") {
+		return "denied", nil
+	}
+	return "password", nil
+}
+
+// execAsSudo prefixes cmd with sudo using a 30s timeout (the default for one-
+// off quick commands like mkdir / chmod). For long-running operations supply
+// your own context via execAsSudoCtx.
+func (a *App) execAsSudo(id, cmd string) (*sshpkg.ExecResult, error) {
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	return a.execAsSudoCtx(ctx, id, cmd)
+}
+
+// execAsSudoCtx is the underlying sudo'd exec. It piggybacks on the cached
+// sudo password if there is one (`sudo -S -p ''`); otherwise falls back to
+// non-interactive (`sudo -n`), which fails fast for non-NOPASSWD setups.
+func (a *App) execAsSudoCtx(ctx context.Context, id, cmd string) (*sshpkg.ExecResult, error) {
+	conn, err := a.pool.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	a.sudoMu.Lock()
+	pwd, hasPwd := a.sudoPasswords[id]
+	a.sudoMu.Unlock()
+	if hasPwd {
+		return conn.ExecWithStdin(ctx, "sudo -S -p '' "+cmd, pwd+"\n")
+	}
+	return conn.Exec(ctx, "sudo -n "+cmd)
+}
+
+// execFn returns a migration.ExecFn that runs commands on the given VPS,
+// optionally wrapped with sudo. The returned function is safe to call across
+// goroutine boundaries — it re-resolves the connection from the pool each
+// call, so it survives transient reconnects.
+func (a *App) execFn(id string, useSudo bool) migration.ExecFn {
+	if useSudo {
+		return func(ctx context.Context, cmd string) (*sshpkg.ExecResult, error) {
+			return a.execAsSudoCtx(ctx, id, cmd)
+		}
+	}
+	return func(ctx context.Context, cmd string) (*sshpkg.ExecResult, error) {
+		conn, err := a.pool.Get(id)
+		if err != nil {
+			return nil, err
+		}
+		return conn.Exec(ctx, cmd)
+	}
+}
+
+// sudoErr distills an ExecResult+err pair into one error suitable for the UI.
+// It special-cases the "password required" failure mode so the frontend can
+// react by prompting for one.
+func sudoErr(res *sshpkg.ExecResult, err error) error {
+	if err != nil {
+		return err
+	}
+	if res.ExitCode == 0 {
+		return nil
+	}
+	msg := strings.TrimSpace(res.Stderr)
+	if msg == "" {
+		msg = strings.TrimSpace(res.Stdout)
+	}
+	if msg == "" {
+		msg = fmt.Sprintf("exit %d", res.ExitCode)
+	}
+	if strings.Contains(msg, "a password is required") ||
+		strings.Contains(msg, "no tty present") {
+		return errors.New("sudo password required")
+	}
+	if strings.Contains(msg, "is not in the sudoers file") ||
+		strings.Contains(msg, "not allowed to execute") {
+		return errors.New("this user is not allowed to use sudo")
+	}
+	return errors.New(msg)
 }
 
 // ───────── Permissions ─────────
@@ -205,31 +372,59 @@ func (a *App) StatRemoteFile(id, p string) (*PathInfo, error) {
 }
 
 // ChmodRemoteFile sets the mode on p. mode is parsed as octal (with or without
-// a leading 0), e.g. "755" or "0755".
-func (a *App) ChmodRemoteFile(id, p, mode string) error {
-	conn, err := a.pool.Get(id)
-	if err != nil {
-		return err
-	}
+// a leading 0), e.g. "755" or "0755". With useSudo=true, runs `sudo chmod`
+// instead of SFTP's Chmod (since SFTP can't elevate).
+func (a *App) ChmodRemoteFile(id, p, mode string, useSudo bool) error {
 	mode = strings.TrimSpace(mode)
 	if mode == "" {
 		return fmt.Errorf("mode is required")
 	}
-	mode = strings.TrimPrefix(mode, "0o")
-	mode = strings.TrimPrefix(mode, "0")
-	if mode == "" {
-		mode = "0"
+	clean := strings.TrimPrefix(strings.TrimPrefix(mode, "0o"), "0")
+	if clean == "" {
+		clean = "0"
 	}
-	m, err := strconv.ParseUint(mode, 8, 32)
+	m, err := strconv.ParseUint(clean, 8, 32)
 	if err != nil {
 		return fmt.Errorf("invalid mode (use octal like 755): %w", err)
+	}
+	if useSudo {
+		res, err := a.execAsSudo(id, fmt.Sprintf("chmod %o %s", m, shellQuote(p)))
+		return sudoErr(res, err)
+	}
+	conn, err := a.pool.Get(id)
+	if err != nil {
+		return err
 	}
 	return sftp.Chmod(conn.Client, p, os.FileMode(m))
 }
 
 // ChownRemoteFile changes owner and/or group of p. owner and group may be
 // either a name or a numeric id; an empty string leaves that side unchanged.
-func (a *App) ChownRemoteFile(id, p, owner, group string) error {
+// With useSudo=true, runs `sudo chown` (the usual case — only root can chown).
+func (a *App) ChownRemoteFile(id, p, owner, group string, useSudo bool) error {
+	owner = strings.TrimSpace(owner)
+	group = strings.TrimSpace(group)
+	if owner == "" && group == "" {
+		return nil
+	}
+
+	if useSudo {
+		// chown accepts owner, :group, or owner:group directly — no need to
+		// resolve names to numeric IDs ourselves.
+		var spec string
+		switch {
+		case owner != "" && group != "":
+			spec = owner + ":" + group
+		case owner != "":
+			spec = owner
+		default:
+			spec = ":" + group
+		}
+		res, err := a.execAsSudo(id, "chown "+shellQuote(spec)+" "+shellQuote(p))
+		return sudoErr(res, err)
+	}
+
+	// Non-sudo path: SFTP needs numeric uid/gid, so resolve via getent.
 	conn, err := a.pool.Get(id)
 	if err != nil {
 		return err
@@ -238,22 +433,19 @@ func (a *App) ChownRemoteFile(id, p, owner, group string) error {
 	defer cancel()
 
 	uid, gid := -1, -1
-	if s := strings.TrimSpace(owner); s != "" {
-		v, err := resolveID(ctx, conn, "passwd", s)
+	if owner != "" {
+		v, err := resolveID(ctx, conn, "passwd", owner)
 		if err != nil {
 			return fmt.Errorf("owner: %w", err)
 		}
 		uid = v
 	}
-	if s := strings.TrimSpace(group); s != "" {
-		v, err := resolveID(ctx, conn, "group", s)
+	if group != "" {
+		v, err := resolveID(ctx, conn, "group", group)
 		if err != nil {
 			return fmt.Errorf("group: %w", err)
 		}
 		gid = v
-	}
-	if uid < 0 && gid < 0 {
-		return nil
 	}
 	return sftp.Chown(conn.Client, p, uid, gid)
 }
@@ -497,6 +689,64 @@ func (a *App) ClipboardText() (string, error) {
 // SetClipboardText writes text to the system clipboard (terminal copy).
 func (a *App) SetClipboardText(text string) error {
 	return wailsruntime.ClipboardSetText(a.ctx, text)
+}
+
+// ───────── Migration ─────────
+//
+// Migration moves a docker-compose stack from one connected VPS to another.
+// The Inspect step is synchronous and returns the inventory the UI shows.
+// RunMigration kicks off the actual transfer in a goroutine and streams
+// progress via Wails events ("migration:log", "migration:done") so the UI can
+// render a live log without blocking on a many-minute call.
+
+// FindComposeFile picks the first known compose filename present in dir on the
+// source VPS, so the wizard doesn't have to ask the user to type it.
+func (a *App) FindComposeFile(id, dir string) (string, error) {
+	ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
+	defer cancel()
+	// File existence checks don't need elevation — the user already has SFTP
+	// access to anything they can navigate to.
+	return migration.FindComposeFile(ctx, a.execFn(id, false), dir)
+}
+
+// InspectMigration parses the compose stack at sourcePath via
+// `docker compose config --format json` on the source VPS and returns the
+// resolved inventory (services, volumes, env files, bind-mount warnings).
+// useSudo prefixes the docker commands with sudo for users whose docker
+// daemon isn't accessible without it.
+func (a *App) InspectMigration(id, sourcePath string, useSudo bool) (*migration.Inventory, error) {
+	ctx, cancel := context.WithTimeout(a.ctx, 60*time.Second)
+	defer cancel()
+	return migration.Inspect(ctx, a.execFn(id, useSudo), sourcePath)
+}
+
+// RunMigration starts the transfer in a goroutine, streaming each progress
+// line through "migration:log" and emitting "migration:done" with the final
+// outcome ("" on success, an error string otherwise). The call itself returns
+// as soon as the goroutine is launched.
+func (a *App) RunMigration(srcID, dstID string, opts migration.RunOptions, useSudo bool) error {
+	src, err := a.pool.Get(srcID)
+	if err != nil {
+		return fmt.Errorf("source: %w", err)
+	}
+	dst, err := a.pool.Get(dstID)
+	if err != nil {
+		return fmt.Errorf("target: %w", err)
+	}
+	srcExec := a.execFn(srcID, useSudo)
+	dstExec := a.execFn(dstID, useSudo)
+	go func() {
+		log := func(line string) {
+			wailsruntime.EventsEmit(a.ctx, "migration:log", line)
+		}
+		err := migration.Run(a.ctx, src, dst, srcExec, dstExec, opts, log)
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		wailsruntime.EventsEmit(a.ctx, "migration:done", msg)
+	}()
+	return nil
 }
 
 // closeShell is the internal helper used by lifecycle hooks (disconnect,

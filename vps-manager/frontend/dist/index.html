@@ -7,8 +7,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <script type="module" crossorigin src="/assets/index-Chq9cKEL.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/index-DSofI4_k.css">
+  <script type="module" crossorigin src="/assets/index-Cm7CuGXF.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-BbKCunnW.css">
 </head>
 <body>
   <div id="app">
@@ -54,6 +54,7 @@
           <button data-tab="files" class="tab active">Files</button>
           <button data-tab="docker" class="tab">Docker</button>
           <button data-tab="terminal" class="tab">Terminal</button>
+          <button data-tab="migration" class="tab">Migration</button>
         </nav>
 
         <!-- Files tab -->
@@ -85,6 +86,66 @@
         <section id="tab-terminal" class="tab-panel">
           <div id="terminal-placeholder" class="muted center-msg">Connect to open a shell.</div>
           <div id="terminal" class="terminal hidden"></div>
+        </section>
+
+        <!-- Migration tab -->
+        <section id="tab-migration" class="tab-panel">
+          <div class="migration">
+            <!-- Stage 1: pick source + target + compose dir -->
+            <div id="mig-setup" class="mig-stage">
+              <h3>Migrate a Compose stack</h3>
+              <p class="muted" style="font-size:13px;margin:0 0 16px;">
+                Moves a docker-compose stack from one VPS to another: compose file,
+                env files, and named volumes. The source is never shut down by
+                the app — you'll do that yourself after verifying the target.
+              </p>
+              <label>Source VPS
+                <select id="mig-src"></select>
+              </label>
+              <label>Compose directory on source
+                <input type="text" id="mig-src-path" placeholder="/root/my-app" class="mono" />
+              </label>
+              <label>Target VPS
+                <select id="mig-dst"></select>
+              </label>
+              <label>Compose directory on target
+                <input type="text" id="mig-dst-path" placeholder="/root/my-app" class="mono" />
+              </label>
+              <label class="checkbox-row" style="margin-bottom:6px;">
+                <input type="checkbox" id="mig-sudo" />
+                <span>Use sudo on both VPSes</span>
+              </label>
+              <p class="muted" style="font-size:12px;margin:0 0 12px;">
+                Required when the SSH user can't write to the target compose dir,
+                or when docker isn't accessible without sudo. Prompted for once
+                per VPS per session.
+              </p>
+              <div class="modal-actions" style="margin-top:16px;">
+                <button id="mig-inspect" class="btn">Inspect stack</button>
+              </div>
+              <p id="mig-setup-err" class="err-msg hidden"></p>
+            </div>
+
+            <!-- Stage 2: inventory + run -->
+            <div id="mig-inventory" class="mig-stage hidden">
+              <h3>Migration plan</h3>
+              <div id="mig-summary" class="mig-summary"></div>
+              <div class="modal-actions" style="margin-top:16px;">
+                <button id="mig-back" class="btn btn-secondary">Back</button>
+                <button id="mig-run" class="btn">Run migration</button>
+              </div>
+            </div>
+
+            <!-- Stage 3: live log -->
+            <div id="mig-run-view" class="mig-stage hidden">
+              <h3>Migration in progress</h3>
+              <pre id="mig-log" class="mig-log mono"></pre>
+              <div id="mig-outcome" class="hidden"></div>
+              <div class="modal-actions" style="margin-top:12px;">
+                <button id="mig-reset" class="btn btn-secondary hidden">Start another</button>
+              </div>
+            </div>
+          </div>
         </section>
       </div>
     </main>
@@ -149,12 +210,52 @@
           <label>Owner<input type="text" id="perms-owner" name="owner" placeholder="user or uid" /></label>
           <label>Group<input type="text" id="perms-group" name="group" placeholder="group or gid" /></label>
         </div>
+        <label class="checkbox-row">
+          <input type="checkbox" id="perms-sudo" />
+          <span>Use sudo</span>
+        </label>
         <p class="muted" style="font-size:12px;margin:4px 0 12px;">
           Changing owner/group usually requires root on the remote.
         </p>
         <div class="modal-actions">
           <button type="button" id="perms-cancel" class="btn btn-secondary">Cancel</button>
           <button type="submit" class="btn">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ───── Modal: new folder ───── -->
+  <div id="mkdir-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3>New Folder</h3>
+      <p id="mkdir-parent" class="mono muted" style="word-break:break-all;margin:0 0 12px;"></p>
+      <form id="mkdir-form" autocomplete="off">
+        <label>Name<input type="text" id="mkdir-name" required placeholder="my-folder" /></label>
+        <label class="checkbox-row">
+          <input type="checkbox" id="mkdir-sudo" />
+          <span>Use sudo</span>
+        </label>
+        <div class="modal-actions">
+          <button type="button" id="mkdir-cancel" class="btn btn-secondary">Cancel</button>
+          <button type="submit" class="btn">Create</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ───── Modal: sudo password ───── -->
+  <div id="sudo-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3>Sudo password</h3>
+      <p class="muted" style="font-size:12px;margin:0 0 12px;">
+        Held in memory for this session and cleared on disconnect. Never written to disk.
+      </p>
+      <form id="sudo-form" autocomplete="off">
+        <label>Password<input type="password" id="sudo-pw" required /></label>
+        <div class="modal-actions">
+          <button type="button" id="sudo-cancel" class="btn btn-secondary">Cancel</button>
+          <button type="submit" class="btn">Set</button>
         </div>
       </form>
     </div>

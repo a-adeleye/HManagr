@@ -186,6 +186,55 @@ func (c *Connection) Exec(ctx context.Context, cmd string) (*ExecResult, error) 
 	}
 }
 
+// ExecWithStdin behaves like Exec but pipes the given string into the remote
+// process's stdin. Used for `sudo -S` so the password never appears on the
+// command line (no /proc/<pid>/cmdline leak, no audit-log capture).
+func (c *Connection) ExecWithStdin(ctx context.Context, cmd, stdin string) (*ExecResult, error) {
+	session, err := c.Client.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("new session: %w", err)
+	}
+	defer session.Close()
+
+	var stdout, stderr bytes.Buffer
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+
+	stdinPipe, err := session.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdin pipe: %w", err)
+	}
+
+	if err := session.Start(cmd); err != nil {
+		return nil, fmt.Errorf("start: %w", err)
+	}
+
+	go func() {
+		_, _ = io.WriteString(stdinPipe, stdin)
+		_ = stdinPipe.Close()
+	}()
+
+	done := make(chan error, 1)
+	go func() { done <- session.Wait() }()
+
+	select {
+	case <-ctx.Done():
+		_ = session.Signal(ssh.SIGKILL)
+		<-done
+		return &ExecResult{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: -1}, ctx.Err()
+	case err := <-done:
+		res := &ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
+		if err == nil {
+			return res, nil
+		}
+		if exitErr, ok := err.(*ssh.ExitError); ok {
+			res.ExitCode = exitErr.ExitStatus()
+			return res, nil
+		}
+		return res, err
+	}
+}
+
 // Session is a live interactive shell backed by a PTY on the remote host.
 // Unlike Exec (one-shot, stateless), a Session is long-lived: the remote shell
 // keeps its working directory, environment, and any foreground program (psql,

@@ -510,11 +510,124 @@ input, button, select { font-family: inherit; user-select: text; }
   grid-template-columns: 100px 1fr;
   gap: 10px;
 }
+/* Inline checkbox + label, left-aligned. Overrides the default vertical /
+   uppercase styling that .modal-content label applies. */
+.modal-content label.checkbox-row {
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 400;
+  cursor: pointer;
+  user-select: none;
+}
+.modal-content label.checkbox-row input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
 .modal-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
   margin-top: 8px;
+}
+
+/* ───────── Migration ───────── */
+.migration {
+  padding: 20px 24px;
+  overflow-y: auto;
+  max-width: 720px;
+  margin: 0 auto;
+  width: 100%;
+}
+.mig-stage h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 600;
+}
+.mig-stage label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}
+.mig-stage input,
+.mig-stage select {
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  outline: none;
+  text-transform: none;
+  letter-spacing: normal;
+  transition: border-color 120ms ease;
+}
+.mig-stage input:focus,
+.mig-stage select:focus { border-color: var(--accent); }
+.mig-summary {
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.mig-summary h4 {
+  margin: 12px 0 4px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+.mig-summary h4:first-child { margin-top: 0; }
+.mig-summary ul { margin: 0; padding-left: 20px; }
+.mig-summary .warn {
+  background: rgba(245, 158, 11, 0.08);
+  border-left: 3px solid #f59e0b;
+  padding: 8px 12px;
+  margin-top: 10px;
+  font-size: 12px;
+}
+.mig-log {
+  background: #050709;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 16px;
+  font-size: 12px;
+  color: #d4d7dd;
+  margin: 0;
+  max-height: 480px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+#mig-outcome {
+  margin-top: 12px;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+#mig-outcome.ok { background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.4); color: #86efac; }
+#mig-outcome.err { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; }
+.err-msg {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--danger);
 }
 
 /* ───────── File editor modal ───────── */

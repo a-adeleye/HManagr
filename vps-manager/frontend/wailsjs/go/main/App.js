@@ -110,20 +110,48 @@ export function CloseShell(arg1) {
   return window['go']['main']['App']['CloseShell'](arg1);
 }
 
-export function MakeDir(arg1, arg2) {
-  return window['go']['main']['App']['MakeDir'](arg1, arg2);
+export function MakeDir(arg1, arg2, arg3) {
+  return window['go']['main']['App']['MakeDir'](arg1, arg2, arg3);
 }
 
 export function StatRemoteFile(arg1, arg2) {
   return window['go']['main']['App']['StatRemoteFile'](arg1, arg2);
 }
 
-export function ChmodRemoteFile(arg1, arg2, arg3) {
-  return window['go']['main']['App']['ChmodRemoteFile'](arg1, arg2, arg3);
+export function ChmodRemoteFile(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['ChmodRemoteFile'](arg1, arg2, arg3, arg4);
 }
 
-export function ChownRemoteFile(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['ChownRemoteFile'](arg1, arg2, arg3, arg4);
+export function ChownRemoteFile(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['ChownRemoteFile'](arg1, arg2, arg3, arg4, arg5);
+}
+
+export function SetSudoPassword(arg1, arg2) {
+  return window['go']['main']['App']['SetSudoPassword'](arg1, arg2);
+}
+
+export function HasSudoPassword(arg1) {
+  return window['go']['main']['App']['HasSudoPassword'](arg1);
+}
+
+export function ClearSudoPassword(arg1) {
+  return window['go']['main']['App']['ClearSudoPassword'](arg1);
+}
+
+export function ProbeSudo(arg1) {
+  return window['go']['main']['App']['ProbeSudo'](arg1);
+}
+
+export function FindComposeFile(arg1, arg2) {
+  return window['go']['main']['App']['FindComposeFile'](arg1, arg2);
+}
+
+export function InspectMigration(arg1, arg2, arg3) {
+  return window['go']['main']['App']['InspectMigration'](arg1, arg2, arg3);
+}
+
+export function RunMigration(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['RunMigration'](arg1, arg2, arg3, arg4);
 }
 
 export function ClipboardText() {

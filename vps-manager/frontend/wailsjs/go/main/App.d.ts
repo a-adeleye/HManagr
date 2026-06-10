@@ -51,13 +51,27 @@ export function ResizeShell(arg1:string,arg2:number,arg3:number):Promise<void>;
 
 export function CloseShell(arg1:string):Promise<void>;
 
-export function MakeDir(arg1:string,arg2:string):Promise<void>;
+export function MakeDir(arg1:string,arg2:string,arg3:boolean):Promise<void>;
 
 export function StatRemoteFile(arg1:string,arg2:string):Promise<main.PathInfo>;
 
-export function ChmodRemoteFile(arg1:string,arg2:string,arg3:string):Promise<void>;
+export function ChmodRemoteFile(arg1:string,arg2:string,arg3:string,arg4:boolean):Promise<void>;
 
-export function ChownRemoteFile(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
+export function ChownRemoteFile(arg1:string,arg2:string,arg3:string,arg4:string,arg5:boolean):Promise<void>;
+
+export function SetSudoPassword(arg1:string,arg2:string):Promise<void>;
+
+export function HasSudoPassword(arg1:string):Promise<boolean>;
+
+export function ClearSudoPassword(arg1:string):Promise<void>;
+
+export function ProbeSudo(arg1:string):Promise<string>;
+
+export function FindComposeFile(arg1:string,arg2:string):Promise<string>;
+
+export function InspectMigration(arg1:string,arg2:string,arg3:boolean):Promise<any>;
+
+export function RunMigration(arg1:string,arg2:string,arg3:any,arg4:boolean):Promise<void>;
 
 export function ClipboardText():Promise<string>;
 
