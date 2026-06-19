@@ -17,11 +17,16 @@
           <span class="brand-dot"></span>
           <h1>VPS Manager</h1>
         </div>
-        <button id="add-vps-btn" class="btn-icon" title="Add VPS">+</button>
+        <button id="add-btn" class="btn-icon" title="Add">+</button>
+      </div>
+      <div class="sidebar-switch">
+        <button data-side="servers" class="side-btn active">Servers</button>
+        <button data-side="projects" class="side-btn">Projects</button>
       </div>
       <ul id="vps-list" class="vps-list">
         <li class="vps-empty muted">No servers yet. Click + to add one.</li>
       </ul>
+      <ul id="project-list" class="vps-list hidden"></ul>
     </aside>
 
     <!-- ───── Main panel ───── -->
@@ -51,7 +56,9 @@
         <nav class="tabs">
           <button data-tab="files" class="tab active">Files</button>
           <button data-tab="docker" class="tab">Docker</button>
+          <button data-tab="db" class="tab">Databases</button>
           <button data-tab="terminal" class="tab">Terminal</button>
+          <button data-tab="deploy" class="tab">Deploy</button>
           <button data-tab="migration" class="tab">Migration</button>
         </nav>
 
@@ -74,9 +81,67 @@
         <section id="tab-docker" class="tab-panel">
           <div class="docker-toolbar">
             <button id="docker-refresh" class="btn btn-secondary">Refresh</button>
+            <label class="checkbox-row db-sudo-row hidden" id="docker-scope-row" title="Show every container on the server, not just this project's stack">
+              <input type="checkbox" id="docker-all" />
+              <span>All containers</span>
+            </label>
+            <span id="docker-scope-note" class="muted hidden" style="font-size:11px;"></span>
           </div>
           <div id="docker-list" class="docker-list">
             <p class="muted center-msg">Connect to view containers.</p>
+          </div>
+        </section>
+
+        <!-- Databases tab -->
+        <section id="tab-db" class="tab-panel">
+          <div class="db-toolbar">
+            <label class="db-tb-label">Container
+              <select id="db-container"></select>
+            </label>
+            <label class="db-tb-label">Database
+              <select id="db-database"></select>
+            </label>
+            <label class="checkbox-row db-sudo-row" title="Run docker commands with sudo">
+              <input type="checkbox" id="db-sudo" />
+              <span>sudo</span>
+            </label>
+            <label class="checkbox-row db-sudo-row hidden" id="db-scope-row" title="Show all containers and databases on the server, not just this project's">
+              <input type="checkbox" id="db-all" />
+              <span>Show all</span>
+            </label>
+            <button id="db-refresh" class="btn btn-secondary">Refresh</button>
+            <div class="db-mode-switch">
+              <button id="db-mode-tables" class="mode-btn active">Tables</button>
+              <button id="db-mode-sql" class="mode-btn">SQL</button>
+            </div>
+          </div>
+
+          <div id="db-empty" class="muted center-msg">Connect to browse databases.</div>
+
+          <div id="db-tables-view" class="db-body hidden">
+            <div id="db-table-list" class="db-table-list"></div>
+            <div class="db-grid-wrap">
+              <div class="db-grid-toolbar">
+                <span id="db-grid-title" class="mono"></span>
+                <span id="db-grid-count" class="muted"></span>
+                <span class="spacer"></span>
+                <button id="db-insert" class="btn btn-secondary hidden">+ Row</button>
+                <button id="db-prev" class="btn-icon" title="Previous page">‹</button>
+                <span id="db-page" class="muted mono"></span>
+                <button id="db-next" class="btn-icon" title="Next page">›</button>
+              </div>
+              <div id="db-grid" class="db-grid"><p class="muted center-msg">Pick a table.</p></div>
+            </div>
+          </div>
+
+          <div id="db-sql-view" class="db-body db-sql hidden">
+            <textarea id="db-sql-input" class="mono" spellcheck="false"
+              placeholder="SELECT * FROM users LIMIT 10;&#10;UPDATE / INSERT / DELETE also work — Ctrl+Enter to run."></textarea>
+            <div class="db-sql-actions">
+              <span class="muted" style="font-size:11px;">Runs against the selected container & database · Ctrl+Enter</span>
+              <button id="db-sql-run" class="btn">Run</button>
+            </div>
+            <div id="db-sql-result" class="db-grid db-sql-result"></div>
           </div>
         </section>
 
@@ -84,6 +149,32 @@
         <section id="tab-terminal" class="tab-panel">
           <div id="terminal-placeholder" class="muted center-msg">Connect to open a shell.</div>
           <div id="terminal" class="terminal hidden"></div>
+        </section>
+
+        <!-- Deploy tab -->
+        <section id="tab-deploy" class="tab-panel">
+          <div id="deploy-list-view" class="deploy-wrap">
+            <div class="deploy-toolbar">
+              <div>
+                <h3 style="margin:0;font-size:15px;">Deployments</h3>
+                <p class="muted" style="font-size:12px;margin:2px 0 0;">
+                  Clone a GitHub repo onto a VPS, write a .env from your variables, and run
+                  <code>docker compose up -d --build</code>.
+                </p>
+              </div>
+              <button id="deploy-add" class="btn">+ New deployment</button>
+            </div>
+            <div id="deploy-list" class="deploy-list"></div>
+          </div>
+
+          <div id="deploy-run-view" class="deploy-wrap hidden">
+            <div class="deploy-run-head">
+              <h3 id="deploy-run-title" style="margin:0;font-size:15px;"></h3>
+              <button id="deploy-run-back" class="btn btn-secondary">Back to list</button>
+            </div>
+            <pre id="deploy-log" class="mig-log mono"></pre>
+            <div id="deploy-outcome" class="deploy-outcome hidden"></div>
+          </div>
         </section>
 
         <!-- Migration tab -->
@@ -115,8 +206,8 @@
               </label>
               <p class="muted" style="font-size:12px;margin:0 0 12px;">
                 Required when the SSH user can't write to the target compose dir,
-                or when docker isn't accessible without sudo. Prompted for once
-                per VPS per session.
+                or when docker isn't accessible without sudo. Assumes passwordless
+                sudo (or root) — if sudo is refused, the error is shown as-is.
               </p>
               <div class="modal-actions" style="margin-top:16px;">
                 <button id="mig-inspect" class="btn">Inspect stack</button>
@@ -181,6 +272,57 @@
     </div>
   </div>
 
+  <!-- ───── Modal: add / edit project ───── -->
+  <div id="project-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3 id="project-modal-title">New Project</h3>
+      <form id="project-form" autocomplete="off">
+        <label>Project name<input type="text" name="name" required placeholder="my-app (prod)" /></label>
+
+        <label>Server
+          <select id="project-server-mode">
+            <option value="existing">Use an existing server</option>
+            <option value="new">Enter new server details</option>
+          </select>
+        </label>
+
+        <label id="project-existing-field">Server
+          <select id="project-vps"></select>
+        </label>
+
+        <div id="project-new-fields" class="hidden">
+          <label>Server name<input type="text" id="np-name" placeholder="prod-web-1" /></label>
+          <label>Host<input type="text" id="np-host" placeholder="192.168.1.100 or example.com" /></label>
+          <div class="row">
+            <label>Port<input type="number" id="np-port" value="22" min="1" max="65535" /></label>
+            <label>User<input type="text" id="np-user" placeholder="root" /></label>
+          </div>
+          <label>Authentication
+            <select id="np-authType">
+              <option value="key">SSH Key</option>
+              <option value="password">Password</option>
+            </select>
+          </label>
+          <label id="np-key-field">SSH Key Path<input type="text" id="np-keyPath" placeholder="~/.ssh/id_rsa" /></label>
+          <label id="np-password-field" class="hidden">Password<input type="password" id="np-password" /></label>
+        </div>
+
+        <label>Deploy path
+          <input type="text" name="path" required placeholder="/root/my-app" class="mono" />
+        </label>
+        <label>Database (optional)
+          <input type="text" name="database" placeholder="leave blank to use the container's default" class="mono" />
+        </label>
+        <input type="hidden" name="id" />
+        <input type="hidden" name="vpsId" />
+        <div class="modal-actions">
+          <button type="button" id="project-cancel" class="btn btn-secondary">Cancel</button>
+          <button type="submit" class="btn">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- ───── Modal: file editor ───── -->
   <div id="editor-modal" class="modal hidden">
     <div class="modal-content editor-modal-content">
@@ -237,6 +379,63 @@
         <div class="modal-actions">
           <button type="button" id="mkdir-cancel" class="btn btn-secondary">Cancel</button>
           <button type="submit" class="btn">Create</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ───── Modal: DB row insert / edit ───── -->
+  <div id="db-row-modal" class="modal hidden">
+    <div class="modal-content db-row-modal-content">
+      <h3 id="db-row-title">Edit row</h3>
+      <p id="db-row-table" class="mono muted" style="margin:0 0 12px;word-break:break-all;"></p>
+      <form id="db-row-form" autocomplete="off">
+        <div id="db-row-fields" class="db-row-fields"></div>
+        <div class="modal-actions">
+          <button type="button" id="db-row-cancel" class="btn btn-secondary">Cancel</button>
+          <button type="submit" class="btn">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ───── Modal: add / edit deployment ───── -->
+  <div id="deploy-modal" class="modal hidden">
+    <div class="modal-content deploy-modal-content">
+      <h3 id="deploy-modal-title">New deployment</h3>
+      <form id="deploy-form" autocomplete="off">
+        <div class="row" style="grid-template-columns: 1fr 1fr;">
+          <label>Name<input type="text" name="name" required placeholder="my-app" /></label>
+          <label>Target VPS
+            <select id="deploy-vps" name="vpsId" required></select>
+          </label>
+        </div>
+        <label>GitHub repo URL
+          <input type="text" name="repoUrl" required placeholder="https://github.com/owner/repo" class="mono" />
+        </label>
+        <div class="row" style="grid-template-columns: 1fr 1fr;">
+          <label>Branch<input type="text" name="branch" placeholder="main" class="mono" /></label>
+          <label>Compose file (optional)<input type="text" name="composeFile" placeholder="auto-detect" class="mono" /></label>
+        </div>
+        <label>Deploy path on VPS
+          <input type="text" name="path" required placeholder="/opt/apps/my-app" class="mono" />
+        </label>
+        <label>GitHub token (optional — private repos)
+          <input type="password" name="githubToken" placeholder="ghp_… / github_pat_…" />
+        </label>
+        <div class="deploy-env-head">
+          <span>Environment variables & secrets</span>
+          <button type="button" id="deploy-env-add" class="btn btn-secondary">+ Add</button>
+        </div>
+        <div id="deploy-env-rows" class="deploy-env-rows"></div>
+        <label class="checkbox-row">
+          <input type="checkbox" id="deploy-sudo" name="useSudo" />
+          <span>Use sudo (passwordless sudo assumed; errors shown as-is)</span>
+        </label>
+        <input type="hidden" name="id" />
+        <div class="modal-actions">
+          <button type="button" id="deploy-cancel" class="btn btn-secondary">Cancel</button>
+          <button type="submit" class="btn">Save</button>
         </div>
       </form>
     </div>

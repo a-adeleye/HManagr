@@ -48,6 +48,10 @@ export function EventsOff(eventName, ...additionalEventNames) {
     return window.runtime.EventsOff(eventName, ...additionalEventNames);
 }
 
+export function EventsOffAll() {
+  return window.runtime.EventsOffAll();
+}
+
 export function EventsOnce(eventName, callback) {
     return EventsOnMultiple(eventName, callback, 1);
 }
@@ -237,18 +241,58 @@ export function ResolveFilePaths(files) {
     return window.runtime.ResolveFilePaths(files);
 }
 
-export function OpenFileDialog(dialogOptions) {
-    return window.runtime.OpenFileDialog(dialogOptions);
+export function InitializeNotifications() {
+    return window.runtime.InitializeNotifications();
 }
 
-export function SaveFileDialog(dialogOptions) {
-    return window.runtime.SaveFileDialog(dialogOptions);
+export function CleanupNotifications() {
+    return window.runtime.CleanupNotifications();
 }
 
-export function OpenDirectoryDialog(dialogOptions) {
-    return window.runtime.OpenDirectoryDialog(dialogOptions);
+export function IsNotificationAvailable() {
+    return window.runtime.IsNotificationAvailable();
 }
 
-export function OpenMultipleFilesDialog(dialogOptions) {
-    return window.runtime.OpenMultipleFilesDialog(dialogOptions);
+export function RequestNotificationAuthorization() {
+    return window.runtime.RequestNotificationAuthorization();
+}
+
+export function CheckNotificationAuthorization() {
+    return window.runtime.CheckNotificationAuthorization();
+}
+
+export function SendNotification(options) {
+    return window.runtime.SendNotification(options);
+}
+
+export function SendNotificationWithActions(options) {
+    return window.runtime.SendNotificationWithActions(options);
+}
+
+export function RegisterNotificationCategory(category) {
+    return window.runtime.RegisterNotificationCategory(category);
+}
+
+export function RemoveNotificationCategory(categoryId) {
+    return window.runtime.RemoveNotificationCategory(categoryId);
+}
+
+export function RemoveAllPendingNotifications() {
+    return window.runtime.RemoveAllPendingNotifications();
+}
+
+export function RemovePendingNotification(identifier) {
+    return window.runtime.RemovePendingNotification(identifier);
+}
+
+export function RemoveAllDeliveredNotifications() {
+    return window.runtime.RemoveAllDeliveredNotifications();
+}
+
+export function RemoveDeliveredNotification(identifier) {
+    return window.runtime.RemoveDeliveredNotification(identifier);
+}
+
+export function RemoveNotification(identifier) {
+    return window.runtime.RemoveNotification(identifier);
 }

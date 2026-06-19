@@ -11,12 +11,17 @@ import {
   Connect, Disconnect, IsConnected,
   ListFiles, DownloadFile, UploadFile, DeleteRemoteFile, MakeDir, DefaultDownloadDir,
   StatRemoteFile, ChmodRemoteFile, ChownRemoteFile,
-  SetSudoPassword, HasSudoPassword, ProbeSudo,
+  SetSudoPassword, HasSudoPassword,
   FindComposeFile, InspectMigration, RunMigration,
   ReadRemoteFile, WriteRemoteFile,
   ListContainers, RestartContainer, StopContainer, StartContainer, ContainerLogs,
   StartShell, WriteShell, ResizeShell, CloseShell,
   ClipboardText, SetClipboardText, ChooseSavePath, ChooseOpenPath,
+  ListDBContainers, DBListDatabases, DBListTables, DBTableColumns, DBTableRows,
+  DBQuery, DBInsertRow, DBUpdateRow, DBDeleteRow,
+  ListDeployments, SaveDeployment, DeleteDeployment, RunDeploy,
+  LocalAvailable, LocalUnavailableReason, LocalStartDir,
+  ListProjects, SaveProject, DeleteProject,
 } from '../wailsjs/go/main/App'
 import { EventsOn } from '../wailsjs/runtime/runtime'
 
@@ -30,14 +35,36 @@ const state = {
   editorPath: null,
 }
 
+// Whether the currently-selected environment is the virtual local machine.
+const isLocalSel = () => state.selectedId === 'local'
+
+// Local-mode availability (a host POSIX shell exists), resolved once at startup.
+state.localAvailable = true
+state.localReason = ''
+
+// Projects: named server+path bookmarks. sidebar toggles the list shown.
+state.sidebar = 'servers'      // 'servers' | 'projects'
+state.projects = []
+state.activeProjectId = null   // project currently open (for highlight)
+state.projectPath = null       // deploy path the current session is rooted at
+state.pendingProjectPath = null // set by openProject, consumed by selectVPS
+// When in a project, Docker/DB lists scope to that project's compose stack
+// unless the user opts to see everything on the server.
+state.dockerShowAll = false
+state.dbShowAll = false
+
 // Interactive terminal (xterm.js) bound to a single PTY shell at a time.
 const term = {
   inst: null,        // Terminal instance (created lazily)
   fit: null,         // FitAddon
   vpsId: null,       // VPS whose shell is currently attached
+  rootedPath: null,  // deploy path the attached shell was cd'd into (null = home)
   offOutput: null,   // EventsOn cancel fn for shell:output
   offExit: null,     // EventsOn cancel fn for shell:exit
 }
+
+// shQuote single-quotes a POSIX path for safe injection into a shell command.
+const shQuote = (p) => "'" + String(p).replace(/'/g, `'\\''`) + "'"
 
 // ─────────── Helpers ───────────
 const $ = (id) => document.getElementById(id)
@@ -60,16 +87,28 @@ async function refreshVPSList() {
   renderVPSList()
 }
 
+// Resolve whether local mode is usable (a host POSIX shell was found). When not,
+// the sidebar entry is dimmed and shows the reason instead of relying solely on
+// a Connect-time failure.
+async function refreshLocalAvailability() {
+  try {
+    state.localAvailable = await LocalAvailable()
+    state.localReason = state.localAvailable ? '' : (await LocalUnavailableReason())
+  } catch {
+    state.localAvailable = true
+    state.localReason = ''
+  }
+  renderVPSList()
+}
+
 function renderVPSList() {
   const ul = $('vps-list')
   ul.innerHTML = ''
-  if (state.vpses.length === 0) {
-    ul.innerHTML = '<li class="vps-empty muted">No servers yet. Click + to add one.</li>'
-    return
-  }
   for (const v of state.vpses) {
     const li = document.createElement('li')
-    li.className = 'vps-item' + (state.selectedId === v.id ? ' active' : '')
+    const localUnavail = v.isLocal && !state.localAvailable
+    li.className = 'vps-item' + (state.selectedId === v.id ? ' active' : '') +
+      (v.isLocal ? ' local' : '') + (localUnavail ? ' unavailable' : '')
     li.dataset.id = v.id
     const isConnected = state.selectedId === v.id && state.connected
     li.innerHTML = `
@@ -80,13 +119,29 @@ function renderVPSList() {
       <div class="host"></div>
     `
     li.querySelector('.name').textContent = v.name
-    li.querySelector('.host').textContent = `${v.user}@${v.host}:${v.port || 22}`
+    li.querySelector('.host').textContent = v.isLocal
+      ? (localUnavail ? (state.localReason || 'unavailable on this machine') : '🖥  this machine')
+      : `${v.user}@${v.host}:${v.port || 22}`
+    if (localUnavail) li.title = state.localReason || ''
     li.addEventListener('click', () => selectVPS(v.id))
+    ul.appendChild(li)
+  }
+  // The synthetic Local entry is always present, so the list is never empty;
+  // show the "add a server" hint only when there are no real (SSH) servers.
+  if (!state.vpses.some((v) => !v.isLocal)) {
+    const li = document.createElement('li')
+    li.className = 'vps-empty muted'
+    li.textContent = 'No servers yet. Click + to add one.'
     ul.appendChild(li)
   }
 }
 
 async function selectVPS(id) {
+  // Switching environments: tear down any interactive shell attached to the
+  // previous one so its PTY stream doesn't keep writing into a hidden terminal
+  // (the local env's terminal branch never calls openShell, which is what would
+  // otherwise have detached it).
+  if (state.selectedId && state.selectedId !== id) await detachShell()
   state.selectedId = id
   const v = state.vpses.find((x) => x.id === id)
   if (!v) return
@@ -98,15 +153,40 @@ async function selectVPS(id) {
   $('empty-state').classList.add('hidden')
   $('vps-view').classList.remove('hidden')
   $('vps-name').textContent = v.name
-  $('vps-host').textContent = `${v.user}@${v.host}:${v.port || 22}`
+  $('vps-host').textContent = v.isLocal ? 'this machine — no SSH' : `${v.user}@${v.host}:${v.port || 22}`
+  // Edit/Delete are meaningless for the virtual local entry.
+  $('edit-vps-btn').classList.toggle('hidden', !!v.isLocal)
+  $('delete-vps-btn').classList.toggle('hidden', !!v.isLocal)
+  // Opening a project roots the session at its deploy path; a plain
+  // server/local selection clears any project context.
+  if (state.pendingProjectPath) {
+    state.currentDir = state.pendingProjectPath
+    state.projectPath = state.pendingProjectPath
+    state.pendingProjectPath = null
+  } else {
+    state.projectPath = null
+    state.activeProjectId = null
+    if (v.isLocal) {
+      try { state.currentDir = await LocalStartDir() } catch { state.currentDir = '/' }
+    } else {
+      state.currentDir = '/'
+    }
+  }
+  // Each (re)selection starts scoped: a project shows its own stack, a plain
+  // server shows everything (projectPath null makes the scope a no-op).
+  state.dockerShowAll = false
+  state.dbShowAll = false
   updateStatusUI()
   renderVPSList()
+  renderProjectList()
+  dbResetState()
   if (state.connected) {
     loadCurrentTab()
   } else {
     $('files-list').innerHTML = '<p class="muted center-msg">Connect to browse files.</p>'
     $('docker-list').innerHTML = '<p class="muted center-msg">Connect to view containers.</p>'
     resetTerminalPanel()
+    dbShowEmpty('Connect to browse databases.')
   }
 }
 
@@ -122,6 +202,168 @@ function updateStatusUI() {
     pill.className = 'status-pill disconnected'
     $('connect-btn').classList.remove('hidden')
     $('disconnect-btn').classList.add('hidden')
+  }
+}
+
+// ─────────── Projects ───────────
+// A project is a named server+path bookmark. Opening one selects its server
+// (reusing a live connection) and roots the session at the deploy path.
+async function refreshProjects() {
+  try { state.projects = await ListProjects() || [] } catch { state.projects = [] }
+  renderProjectList()
+}
+
+// serverLabel describes the server a project points at, for the project row.
+function serverLabel(vpsId) {
+  const v = state.vpses.find((x) => x.id === vpsId)
+  if (!v) return '⚠ missing server'
+  return v.isLocal ? 'Local' : `${v.user}@${v.host}`
+}
+
+// activeProject returns the project currently open, or null.
+function activeProject() {
+  return state.projects.find((p) => p.id === state.activeProjectId) || null
+}
+
+function switchSidebar(side) {
+  state.sidebar = side
+  document.querySelectorAll('.side-btn').forEach((b) => b.classList.toggle('active', b.dataset.side === side))
+  $('vps-list').classList.toggle('hidden', side !== 'servers')
+  $('project-list').classList.toggle('hidden', side !== 'projects')
+  $('add-btn').title = side === 'projects' ? 'Add project' : 'Add server'
+}
+
+function renderProjectList() {
+  const ul = $('project-list')
+  ul.innerHTML = ''
+  if (!state.projects.length) {
+    ul.innerHTML = '<li class="vps-empty muted">No projects yet. Click + to add one.</li>'
+    return
+  }
+  for (const p of state.projects) {
+    const li = document.createElement('li')
+    li.className = 'vps-item' + (state.activeProjectId === p.id ? ' active' : '')
+    const isConnected = state.activeProjectId === p.id && state.connected
+    li.innerHTML = `
+      <div class="name-row">
+        <span class="dot ${isConnected ? 'connected' : ''}"></span>
+        <span class="name"></span>
+        <span class="proj-actions"></span>
+      </div>
+      <div class="host"></div>
+      <div class="proj-path"></div>
+    `
+    li.querySelector('.name').textContent = p.name
+    li.querySelector('.host').textContent = serverLabel(p.vpsId)
+    li.querySelector('.proj-path').textContent = p.path
+    const actions = li.querySelector('.proj-actions')
+    const ed = document.createElement('button')
+    ed.textContent = 'Edit'
+    ed.onclick = (e) => { e.stopPropagation(); openProjectModal(p) }
+    const del = document.createElement('button')
+    del.textContent = 'Del'
+    del.onclick = async (e) => {
+      e.stopPropagation()
+      if (!confirm(`Delete project "${p.name}"? (The server itself is kept.)`)) return
+      await DeleteProject(p.id)
+      if (state.activeProjectId === p.id) state.activeProjectId = null
+      refreshProjects()
+    }
+    actions.append(ed, del)
+    li.addEventListener('click', () => openProject(p.id))
+    ul.appendChild(li)
+  }
+}
+
+async function openProject(projectId) {
+  const p = state.projects.find((x) => x.id === projectId)
+  if (!p) return
+  const v = state.vpses.find((x) => x.id === p.vpsId)
+  if (!v) { alert('This project’s server no longer exists. Edit the project to point it at a server.'); return }
+  state.activeProjectId = projectId
+  // selectVPS consumes this to root the session at the deploy path.
+  state.pendingProjectPath = p.path
+  await selectVPS(p.vpsId)
+  // Connect like a server: reuse a live connection, otherwise connect now.
+  if (!state.connected) await doConnect()
+}
+
+// ── Project modal ──
+function projServerOptions() {
+  return state.vpses.map((v) =>
+    `<option value="${v.id}">${v.isLocal ? v.name : `${v.name} (${v.user}@${v.host})`}</option>`).join('')
+}
+
+function toggleProjectServerMode(mode) {
+  $('project-existing-field').classList.toggle('hidden', mode !== 'existing')
+  $('project-new-fields').classList.toggle('hidden', mode !== 'new')
+}
+
+function toggleNpAuth(type) {
+  $('np-key-field').classList.toggle('hidden', type !== 'key')
+  $('np-password-field').classList.toggle('hidden', type !== 'password')
+}
+
+function openProjectModal(project = null) {
+  const form = $('project-form')
+  form.reset()
+  $('project-vps').innerHTML = projServerOptions()
+  $('np-port').value = '22'
+  $('np-authType').value = 'key'
+  toggleNpAuth('key')
+  if (project) {
+    $('project-modal-title').textContent = 'Edit Project'
+    form.elements.namedItem('id').value = project.id
+    form.elements.namedItem('name').value = project.name
+    form.elements.namedItem('path').value = project.path
+    form.elements.namedItem('database').value = project.database || ''
+    form.elements.namedItem('vpsId').value = project.vpsId
+    $('project-server-mode').value = 'existing' // server already exists when editing
+    $('project-vps').value = project.vpsId
+  } else {
+    $('project-modal-title').textContent = 'New Project'
+    form.elements.namedItem('id').value = ''
+    form.elements.namedItem('vpsId').value = ''
+    $('project-server-mode').value = 'existing'
+    if (state.selectedId) $('project-vps').value = state.selectedId
+  }
+  toggleProjectServerMode($('project-server-mode').value)
+  $('project-modal').classList.remove('hidden')
+}
+
+async function submitProjectForm(e) {
+  e.preventDefault()
+  const form = $('project-form')
+  const mode = $('project-server-mode').value
+  const p = {
+    id: form.elements.namedItem('id').value || '',
+    name: form.elements.namedItem('name').value.trim(),
+    path: form.elements.namedItem('path').value.trim(),
+    database: form.elements.namedItem('database').value.trim(),
+    vpsId: '',
+  }
+  // newServer is only consulted by the backend when vpsId is empty.
+  let newServer = { host: '' }
+  if (mode === 'existing') {
+    p.vpsId = $('project-vps').value
+  } else {
+    newServer = {
+      name: $('np-name').value.trim() || $('np-host').value.trim(),
+      host: $('np-host').value.trim(),
+      port: parseInt($('np-port').value || '22', 10),
+      user: $('np-user').value.trim(),
+      authType: $('np-authType').value,
+      keyPath: $('np-keyPath').value.trim(),
+      password: $('np-password').value,
+    }
+  }
+  try {
+    await SaveProject(p, newServer)
+    $('project-modal').classList.add('hidden')
+    await refreshVPSList()   // an inline server may have just been created
+    await refreshProjects()
+  } catch (err) {
+    alert('Save failed: ' + errMsg(err))
   }
 }
 
@@ -167,10 +409,18 @@ function resetTerminalPanel() {
 }
 
 function loadCurrentTab() {
-  // The migration tab uses two VPSes chosen from dropdowns, not the currently-
-  // selected one, so it stays accessible regardless of connection state.
+  // The migration and deploy tabs pick their own VPSes, so they stay
+  // accessible regardless of the selected VPS's connection state.
   if (state.tab === 'migration') {
     migOpen()
+    return
+  }
+  if (state.tab === 'deploy') {
+    deployOpen()
+    return
+  }
+  if (state.tab === 'db') {
+    dbOpen()
     return
   }
   if (!state.connected) return
@@ -181,7 +431,15 @@ function loadCurrentTab() {
   } else if (state.tab === 'docker') {
     loadContainers()
   } else if (state.tab === 'terminal') {
-    openShell()
+    if (isLocalSel()) {
+      // No in-app PTY for local — point the user at their own terminal.
+      $('terminal').classList.add('hidden')
+      const ph = $('terminal-placeholder')
+      ph.classList.remove('hidden')
+      ph.textContent = 'The interactive terminal isn’t available in local mode — use your own terminal on this machine. Docker, Databases, Deploy and Files all work here.'
+    } else {
+      openShell()
+    }
   }
 }
 
@@ -321,25 +579,6 @@ async function submitMkdir(e) {
   }
 }
 
-// ensureSudoReady probes the VPS to see whether sudo needs a password right now
-// (it may not — NOPASSWD setups exist, and a previous session may have cached
-// one that still works). Only prompts the user if a password is actually
-// required. Returns true if sudo is usable, false if the user cancels or the
-// account isn't allowed to sudo at all.
-async function ensureSudoReady(id) {
-  let probe
-  try { probe = await ProbeSudo(id) } catch (e) {
-    alert('Sudo probe failed: ' + errMsg(e))
-    return false
-  }
-  if (probe === 'ok') return true
-  if (probe === 'denied') {
-    alert('This user is not allowed to use sudo on the selected VPS.')
-    return false
-  }
-  return await ensureSudoPassword(id, true)
-}
-
 // ensureSudoPassword resolves true once a sudo password is cached for the VPS,
 // or false if the user cancels. force=true reshows the prompt even if one is
 // already cached (used after a "password required" failure when the cached
@@ -444,9 +683,16 @@ async function deleteFile(path) {
 function goUp() {
   const dir = state.currentDir
   if (dir === '/' || dir === '') return
+  // A Windows drive root ("C:" or "C:/") has nothing above it — don't fall
+  // through to a bare "/", which on Windows silently jumps to the current
+  // drive's root and loses the drive in the breadcrumb.
+  if (/^[A-Za-z]:\/?$/.test(dir)) return
   const parts = dir.replace(/\/$/, '').split('/')
   parts.pop()
-  loadFiles(parts.join('/') || '/')
+  let parent = parts.join('/') || '/'
+  // "C:" addresses the per-drive working dir, not the root — normalize to "C:/".
+  if (/^[A-Za-z]:$/.test(parent)) parent += '/'
+  loadFiles(parent)
 }
 
 // ─────────── File editor ───────────
@@ -495,9 +741,28 @@ async function saveEditor() {
 // ─────────── Docker ───────────
 async function loadContainers() {
   const list = $('docker-list')
+  // In a project, try to scope to its compose stack unless "All" is on.
+  const inProject = !!state.projectPath
+  const wantScope = inProject && !state.dockerShowAll
+  $('docker-scope-row').classList.toggle('hidden', !inProject)
+  $('docker-all').checked = state.dockerShowAll
+  const note = $('docker-scope-note')
+  note.classList.add('hidden')
+
   list.innerHTML = '<p class="muted center-msg">Loading…</p>'
   try {
-    const containers = await ListContainers(state.selectedId) || []
+    let containers = await ListContainers(state.selectedId, wantScope ? state.projectPath : '') || []
+    if (wantScope && containers.length === 0) {
+      // Nothing matched this project's compose stack — its containers may not be
+      // compose-managed, or were started from a different directory. Fall back
+      // to all rather than leaving the list mysteriously empty.
+      containers = await ListContainers(state.selectedId, '') || []
+      note.textContent = `couldn’t match a compose stack at ${state.projectPath} — showing all`
+      note.classList.remove('hidden')
+    } else if (wantScope) {
+      note.textContent = `scoped to ${state.projectPath}`
+      note.classList.remove('hidden')
+    }
     renderContainers(containers)
   } catch (e) {
     list.innerHTML = `<p class="muted center-msg">Error: ${errMsg(e)}</p>`
@@ -575,6 +840,660 @@ async function showLogs(id, name) {
     fitTerm()
   } catch (e) {
     alert('Logs failed: ' + errMsg(e))
+  }
+}
+
+// ─────────── Databases ───────────
+// Browses database engines running in docker containers on the connected VPS:
+// containers → databases → tables → rows, plus a free-form SQL editor.
+// Credentials never reach the frontend — the backend sniffs them from the
+// container env and is addressed purely by container ID.
+const dbs = {
+  containers: [],
+  containerId: null,
+  database: null,
+  tables: [],
+  table: null,     // { schema, name }
+  columns: [],     // [{ name, type, nullable, isPk }]
+  page: 0,
+  pageSize: 50,
+  total: 0,
+  lastResult: null, // QueryResult backing the current grid (for edit/delete)
+  mode: 'tables',
+}
+
+const dbSudo = () => $('db-sudo').checked
+
+function dbResetState() {
+  dbs.containers = []
+  dbs.containerId = null
+  dbs.database = null
+  dbs.tables = []
+  dbs.table = null
+  dbs.columns = []
+  dbs.page = 0
+  dbs.lastResult = null
+  $('db-container').innerHTML = ''
+  $('db-database').innerHTML = ''
+  $('db-table-list').innerHTML = ''
+  $('db-grid').innerHTML = '<p class="muted center-msg">Pick a table.</p>'
+  $('db-sql-result').innerHTML = ''
+}
+
+function dbShowEmpty(msg) {
+  $('db-empty').textContent = msg
+  $('db-empty').classList.remove('hidden')
+  $('db-tables-view').classList.add('hidden')
+  $('db-sql-view').classList.add('hidden')
+}
+
+function dbShowMode() {
+  $('db-empty').classList.add('hidden')
+  $('db-tables-view').classList.toggle('hidden', dbs.mode !== 'tables')
+  $('db-sql-view').classList.toggle('hidden', dbs.mode !== 'sql')
+  $('db-mode-tables').classList.toggle('active', dbs.mode === 'tables')
+  $('db-mode-sql').classList.toggle('active', dbs.mode === 'sql')
+}
+
+async function dbOpen() {
+  if (!state.connected) {
+    dbShowEmpty('Connect to browse databases.')
+    return
+  }
+  dbShowMode()
+  await dbLoadContainers()
+}
+
+async function dbLoadContainers() {
+  const sel = $('db-container')
+  // In a project, try to scope to its compose stack unless "Show all" is on.
+  const inProject = !!state.projectPath
+  const wantScope = inProject && !state.dbShowAll
+  $('db-scope-row').classList.toggle('hidden', !inProject)
+  $('db-all').checked = state.dbShowAll
+  sel.innerHTML = '<option>Loading…</option>'
+  try {
+    dbs.containers = await ListDBContainers(state.selectedId, dbSudo(), wantScope ? state.projectPath : '') || []
+    if (wantScope && dbs.containers.length === 0) {
+      // No DB containers matched the project's stack — fall back to all so the
+      // tab isn't empty (e.g. when the DB runs outside the project's compose).
+      dbs.containers = await ListDBContainers(state.selectedId, dbSudo(), '') || []
+    }
+  } catch (e) {
+    dbShowEmpty('Could not list containers: ' + errMsg(e))
+    return
+  }
+  sel.innerHTML = ''
+  if (!dbs.containers.length) {
+    dbShowEmpty('No database containers found (postgres / mysql / mariadb images are detected).')
+    return
+  }
+  dbShowMode()
+  for (const c of dbs.containers) {
+    const opt = document.createElement('option')
+    opt.value = c.id
+    opt.textContent = `${c.name} · ${c.engine}${c.state !== 'running' ? ' (' + c.state + ')' : ''}`
+    opt.disabled = c.state !== 'running'
+    sel.appendChild(opt)
+  }
+  const prev = dbs.containers.find((c) => c.id === dbs.containerId && c.state === 'running')
+  const pick = prev || dbs.containers.find((c) => c.state === 'running')
+  if (!pick) {
+    dbShowEmpty('Database containers exist but none are running. Start one from the Docker tab.')
+    return
+  }
+  sel.value = pick.id
+  dbs.containerId = pick.id
+  await dbLoadDatabases()
+}
+
+// projectDatabaseFor resolves the database a project is pinned to for container
+// c: the project's explicit Database, else the container's sniffed default.
+function projectDatabaseFor(c) {
+  const p = activeProject()
+  return (p && p.database) || (c && c.defaultDb) || ''
+}
+
+async function dbLoadDatabases() {
+  const c = dbs.containers.find((x) => x.id === dbs.containerId)
+  const sel = $('db-database')
+  sel.innerHTML = '<option>Loading…</option>'
+  try {
+    const list = await DBListDatabases(state.selectedId, dbs.containerId, dbSudo()) || []
+    if (!list.length) {
+      sel.innerHTML = ''
+      $('db-table-list').innerHTML = '<p class="muted center-msg">No databases.</p>'
+      return
+    }
+    // In a project, pin the dropdown to the project's database (unless "Show
+    // all" is on, or that database isn't present on this container).
+    const projectDb = projectDatabaseFor(c)
+    const scoped = state.projectPath && !state.dbShowAll && projectDb && list.includes(projectDb)
+    const shown = scoped ? [projectDb] : list
+    sel.innerHTML = ''
+    for (const name of shown) {
+      const opt = document.createElement('option')
+      opt.value = name
+      opt.textContent = name
+      sel.appendChild(opt)
+    }
+    const prefer = scoped ? projectDb
+      : (dbs.database && shown.includes(dbs.database)) ? dbs.database
+      : (c && shown.includes(c.defaultDb)) ? c.defaultDb : shown[0]
+    sel.value = prefer
+    dbs.database = prefer
+    await dbLoadTables()
+  } catch (e) {
+    sel.innerHTML = ''
+    dbGridMessage($('db-grid'), 'err', 'List databases failed: ' + errMsg(e))
+  }
+}
+
+async function dbLoadTables() {
+  const list = $('db-table-list')
+  list.innerHTML = '<p class="muted center-msg" style="padding:20px 8px;">Loading…</p>'
+  try {
+    dbs.tables = await DBListTables(state.selectedId, dbs.containerId, dbs.database, dbSudo()) || []
+  } catch (e) {
+    list.innerHTML = ''
+    dbGridMessage($('db-grid'), 'err', 'List tables failed: ' + errMsg(e))
+    return
+  }
+  list.innerHTML = ''
+  if (!dbs.tables.length) {
+    list.innerHTML = '<p class="muted" style="padding:12px;font-size:12px;">No tables.</p>'
+    $('db-grid').innerHTML = '<p class="muted center-msg">This database has no tables.</p>'
+    return
+  }
+  const sameTable = dbs.table && dbs.tables.some((t) => t.schema === dbs.table.schema && t.name === dbs.table.name)
+  for (const t of dbs.tables) {
+    const div = document.createElement('div')
+    div.className = 'db-table-item'
+    div.textContent = (t.schema && t.schema !== 'public' && t.schema !== dbs.database) ? `${t.schema}.${t.name}` : t.name
+    div.title = `${t.schema}.${t.name}`
+    div.addEventListener('click', () => dbSelectTable(t))
+    list.appendChild(div)
+  }
+  await dbSelectTable(sameTable ? dbs.table : dbs.tables[0])
+}
+
+async function dbSelectTable(t) {
+  dbs.table = t
+  dbs.page = 0
+  const items = Array.from($('db-table-list').children)
+  items.forEach((el, i) => el.classList.toggle('active',
+    dbs.tables[i] && dbs.tables[i].schema === t.schema && dbs.tables[i].name === t.name))
+  $('db-grid-title').textContent = `${t.schema}.${t.name}`
+  try {
+    dbs.columns = await DBTableColumns(state.selectedId, dbs.containerId, dbs.database, t.schema, t.name, dbSudo()) || []
+  } catch (e) {
+    dbs.columns = []
+    dbGridMessage($('db-grid'), 'err', 'Columns failed: ' + errMsg(e))
+    return
+  }
+  await dbLoadRows()
+}
+
+const dbHasPK = () => dbs.columns.some((c) => c.isPk)
+
+async function dbLoadRows() {
+  const grid = $('db-grid')
+  grid.innerHTML = '<p class="muted center-msg">Loading…</p>'
+  const t = dbs.table
+  try {
+    const res = await DBTableRows(state.selectedId, dbs.containerId, dbs.database,
+      t.schema, t.name, dbs.pageSize, dbs.page * dbs.pageSize, dbSudo())
+    dbs.total = res.total || 0
+    dbs.lastResult = res
+    renderDbGrid(grid, res, { editable: dbHasPK() })
+    const from = dbs.page * dbs.pageSize + 1
+    const to = Math.min(dbs.total, (dbs.page + 1) * dbs.pageSize)
+    $('db-grid-count').textContent = dbs.total ? `${from}–${to} of ${dbs.total} rows` : 'empty'
+    $('db-page').textContent = `p.${dbs.page + 1}`
+    $('db-prev').disabled = dbs.page === 0
+    $('db-next').disabled = to >= dbs.total
+    $('db-insert').classList.remove('hidden')
+    if (!dbHasPK() && dbs.total > 0) {
+      $('db-grid-count').textContent += ' · no primary key — rows are read-only here, use SQL'
+    }
+  } catch (e) {
+    dbGridMessage(grid, 'err', 'Query failed: ' + errMsg(e))
+  }
+}
+
+function dbGridMessage(el, cls, text) {
+  el.innerHTML = ''
+  const div = document.createElement('div')
+  div.className = 'grid-msg ' + cls
+  div.textContent = text
+  el.appendChild(div)
+}
+
+// renderDbGrid renders a QueryResult. With opts.editable, per-row Edit/Delete
+// actions are added (requires the grid to be the current table page).
+function renderDbGrid(el, res, opts = {}) {
+  el.innerHTML = ''
+  if (!res.columns || !res.columns.length) {
+    dbGridMessage(el, 'ok', res.message || 'OK')
+    return
+  }
+  const table = document.createElement('table')
+  const thead = document.createElement('thead')
+  const hr = document.createElement('tr')
+  const pkNames = new Set(dbs.columns.filter((c) => c.isPk).map((c) => c.name))
+  for (const col of res.columns) {
+    const th = document.createElement('th')
+    th.textContent = col
+    if (opts.editable && pkNames.has(col)) {
+      const b = document.createElement('span')
+      b.className = 'pk-badge'
+      b.textContent = '🔑'
+      th.appendChild(b)
+    }
+    hr.appendChild(th)
+  }
+  if (opts.editable) hr.appendChild(document.createElement('th'))
+  thead.appendChild(hr)
+  table.appendChild(thead)
+
+  const tbody = document.createElement('tbody')
+  for (const row of res.rows || []) {
+    const tr = document.createElement('tr')
+    row.forEach((v) => {
+      const td = document.createElement('td')
+      if (v === null || v === undefined) {
+        td.className = 'null'
+        td.textContent = 'NULL'
+      } else {
+        td.textContent = v
+        td.title = v.length > 60 ? v : ''
+      }
+      tr.appendChild(td)
+    })
+    if (opts.editable) {
+      const td = document.createElement('td')
+      td.className = 'row-actions'
+      const ed = document.createElement('button')
+      ed.textContent = 'Edit'
+      ed.onclick = () => openRowModal('edit', res, row)
+      const del = document.createElement('button')
+      del.textContent = 'Del'
+      del.onclick = () => dbDeleteRow(res, row)
+      td.append(ed, del)
+      tr.appendChild(td)
+    }
+    tbody.appendChild(tr)
+  }
+  table.appendChild(tbody)
+  el.appendChild(table)
+  if ((res.rows || []).length === 0) {
+    const div = document.createElement('div')
+    div.className = 'grid-msg'
+    div.textContent = 'No rows.'
+    el.appendChild(div)
+  }
+}
+
+// pkMapFor builds { pkCol: originalValue } for the WHERE clause of an
+// update/delete, using the row as it was loaded.
+function pkMapFor(res, row) {
+  const pk = {}
+  for (const c of dbs.columns) {
+    if (!c.isPk) continue
+    const idx = res.columns.indexOf(c.name)
+    if (idx === -1) return null
+    pk[c.name] = row[idx]
+  }
+  return Object.keys(pk).length ? pk : null
+}
+
+async function dbDeleteRow(res, row) {
+  const pk = pkMapFor(res, row)
+  if (!pk) return alert('No primary key — delete via the SQL editor instead.')
+  const desc = Object.entries(pk).map(([k, v]) => `${k}=${v === null ? 'NULL' : v}`).join(', ')
+  if (!confirm(`Delete row where ${desc}?\nThis cannot be undone.`)) return
+  try {
+    const msg = await DBDeleteRow(state.selectedId, dbs.containerId, dbs.database,
+      dbs.table.schema, dbs.table.name, pk, dbSudo())
+    await dbLoadRows()
+    $('db-grid-count').textContent += ` · ${msg}`
+  } catch (e) {
+    alert('Delete failed: ' + errMsg(e))
+  }
+}
+
+// Row modal state: what a save should do.
+let rowModalCtx = null // { mode: 'insert'|'edit', res, row, original: {col: value|null} }
+
+function openRowModal(mode, res = null, row = null) {
+  if (!dbs.columns.length) return
+  rowModalCtx = { mode, res, row, original: {} }
+  $('db-row-title').textContent = mode === 'insert' ? 'Insert row' : 'Edit row'
+  $('db-row-table').textContent = `${dbs.table.schema}.${dbs.table.name}`
+  const wrap = $('db-row-fields')
+  wrap.innerHTML = ''
+  for (const col of dbs.columns) {
+    let value = null
+    let present = false
+    if (mode === 'edit' && res) {
+      const idx = res.columns.indexOf(col.name)
+      if (idx !== -1) { value = row[idx]; present = true }
+    }
+    rowModalCtx.original[col.name] = present ? value : undefined
+
+    const field = document.createElement('div')
+    field.className = 'db-row-field'
+    const label = document.createElement('label')
+    label.textContent = `${col.name} · ${col.type}${col.isPk ? ' · PK' : ''}`
+    const input = document.createElement('input')
+    input.type = 'text'
+    input.dataset.col = col.name
+    input.value = value === null || value === undefined ? '' : value
+    input.disabled = value === null && mode === 'edit'
+    label.appendChild(input)
+    const nullToggle = document.createElement('label')
+    nullToggle.className = 'null-toggle'
+    const cb = document.createElement('input')
+    cb.type = 'checkbox'
+    cb.dataset.nullFor = col.name
+    cb.checked = mode === 'edit' ? value === null : false
+    cb.addEventListener('change', () => { input.disabled = cb.checked })
+    nullToggle.append(cb, document.createTextNode('NULL'))
+    field.append(label, nullToggle)
+    wrap.appendChild(field)
+  }
+  $('db-row-modal').classList.remove('hidden')
+}
+
+function closeRowModal() {
+  $('db-row-modal').classList.add('hidden')
+  rowModalCtx = null
+}
+
+async function submitRowModal(e) {
+  e.preventDefault()
+  if (!rowModalCtx) return
+  const { mode, res, row } = rowModalCtx
+  const values = {}
+  for (const col of dbs.columns) {
+    const input = document.querySelector(`#db-row-fields input[data-col="${CSS.escape(col.name)}"]`)
+    const nullCb = document.querySelector(`#db-row-fields input[data-null-for="${CSS.escape(col.name)}"]`)
+    if (!input) continue
+    const newVal = nullCb && nullCb.checked ? null : input.value
+    if (mode === 'edit') {
+      // Send only changed columns: avoids clobbering values that don't
+      // round-trip through text cleanly (binary, high-precision types).
+      const orig = rowModalCtx.original[col.name]
+      if (orig === undefined) continue
+      if (newVal === orig) continue
+      values[col.name] = newVal
+    } else {
+      // Insert: skip blank non-null fields so column defaults apply.
+      if (newVal === '' ) continue
+      values[col.name] = newVal
+    }
+  }
+  try {
+    let msg
+    if (mode === 'insert') {
+      if (!Object.keys(values).length) return alert('Nothing to insert — fill at least one field.')
+      msg = await DBInsertRow(state.selectedId, dbs.containerId, dbs.database,
+        dbs.table.schema, dbs.table.name, values, dbSudo())
+    } else {
+      if (!Object.keys(values).length) { closeRowModal(); return }
+      const pk = pkMapFor(res, row)
+      if (!pk) return alert('No primary key — edit via the SQL editor instead.')
+      msg = await DBUpdateRow(state.selectedId, dbs.containerId, dbs.database,
+        dbs.table.schema, dbs.table.name, pk, values, dbSudo())
+    }
+    closeRowModal()
+    await dbLoadRows()
+    $('db-grid-count').textContent += ` · ${msg}`
+  } catch (err) {
+    alert('Save failed: ' + errMsg(err))
+  }
+}
+
+async function dbRunSQL() {
+  const sql = $('db-sql-input').value.trim()
+  if (!sql) return
+  if (!dbs.containerId) return alert('Pick a database container first.')
+  const out = $('db-sql-result')
+  out.innerHTML = '<p class="muted center-msg">Running…</p>'
+  const btn = $('db-sql-run')
+  btn.disabled = true
+  try {
+    const res = await DBQuery(state.selectedId, dbs.containerId, dbs.database, sql, dbSudo())
+    renderDbGrid(out, res, { editable: false })
+  } catch (e) {
+    dbGridMessage(out, 'err', errMsg(e))
+  } finally {
+    btn.disabled = false
+  }
+}
+
+// ─────────── Deploy (GitHub repo → VPS via docker compose) ───────────
+const dep = {
+  list: [],
+  runningId: null,
+  logOff: null,
+  doneOff: null,
+}
+
+function deployOpen() {
+  $('deploy-run-view').classList.add('hidden')
+  $('deploy-list-view').classList.remove('hidden')
+  deployRefresh()
+}
+
+async function deployRefresh() {
+  try {
+    dep.list = await ListDeployments() || []
+  } catch (e) {
+    dep.list = []
+  }
+  renderDeployList()
+}
+
+function renderDeployList() {
+  const list = $('deploy-list')
+  list.innerHTML = ''
+  if (!dep.list.length) {
+    list.innerHTML = '<p class="muted center-msg">No deployments yet. Connect a GitHub repo with “+ New deployment”.</p>'
+    return
+  }
+  for (const d of dep.list) {
+    const vps = state.vpses.find((v) => v.id === d.vpsId)
+    const card = document.createElement('div')
+    card.className = 'deploy-card'
+    card.innerHTML = `
+      <div class="info">
+        <div class="title-line">
+          <span class="name"></span>
+          <span class="deploy-status hidden"></span>
+        </div>
+        <div class="meta repo"></div>
+        <div class="meta target"></div>
+        <div class="meta last hidden"></div>
+      </div>
+      <div class="actions"></div>
+    `
+    card.querySelector('.name').textContent = d.name
+    const st = card.querySelector('.deploy-status')
+    const status = dep.runningId === d.id ? 'running' : d.lastStatus
+    if (status) {
+      st.textContent = status
+      st.className = 'deploy-status ' + status
+    }
+    card.querySelector('.repo').textContent = `${d.repoUrl} @ ${d.branch || 'main'}`
+    card.querySelector('.target').textContent = `${vps ? vps.name : '⚠ missing VPS'} : ${d.path}${d.useSudo ? ' · sudo' : ''}`
+    const last = card.querySelector('.last')
+    if (d.lastDeploy) {
+      last.classList.remove('hidden')
+      const when = new Date(d.lastDeploy)
+      last.textContent = `last: ${when.toLocaleString()}${d.lastCommit ? ' · ' + d.lastCommit : ''}`
+    }
+    const actions = card.querySelector('.actions')
+    const deployBtn = document.createElement('button')
+    deployBtn.className = 'btn'
+    deployBtn.textContent = 'Deploy'
+    deployBtn.disabled = !!dep.runningId
+    deployBtn.onclick = () => startDeploy(d)
+    const editBtn = document.createElement('button')
+    editBtn.className = 'btn btn-secondary'
+    editBtn.textContent = 'Edit'
+    editBtn.onclick = () => openDeployModal(d)
+    const delBtn = document.createElement('button')
+    delBtn.className = 'btn btn-danger'
+    delBtn.textContent = 'Delete'
+    delBtn.onclick = async () => {
+      if (!confirm(`Delete deployment "${d.name}"? (Nothing is removed from the VPS.)`)) return
+      await DeleteDeployment(d.id)
+      deployRefresh()
+    }
+    actions.append(deployBtn, editBtn, delBtn)
+    list.appendChild(card)
+  }
+}
+
+function addEnvRow(key = '', value = '', secret = false) {
+  const row = document.createElement('div')
+  row.className = 'deploy-env-row'
+  const k = document.createElement('input')
+  k.type = 'text'
+  k.placeholder = 'KEY'
+  k.value = key
+  k.className = 'env-key'
+  const v = document.createElement('input')
+  v.type = secret ? 'password' : 'text'
+  v.placeholder = 'value'
+  v.value = value
+  v.className = 'env-value'
+  const secretToggle = document.createElement('label')
+  secretToggle.className = 'secret-toggle'
+  const cb = document.createElement('input')
+  cb.type = 'checkbox'
+  cb.checked = secret
+  cb.className = 'env-secret'
+  cb.addEventListener('change', () => { v.type = cb.checked ? 'password' : 'text' })
+  secretToggle.append(cb, document.createTextNode('secret'))
+  const del = document.createElement('button')
+  del.type = 'button'
+  del.className = 'env-del'
+  del.textContent = '✕'
+  del.onclick = () => row.remove()
+  row.append(k, v, secretToggle, del)
+  $('deploy-env-rows').appendChild(row)
+}
+
+function openDeployModal(d = null) {
+  const form = $('deploy-form')
+  form.reset()
+  $('deploy-env-rows').innerHTML = ''
+  // VPS choices come from the saved list (local included — deploying a repo to
+  // this machine is valid).
+  const sel = $('deploy-vps')
+  sel.innerHTML = state.vpses.map((v) =>
+    `<option value="${v.id}">${v.isLocal ? v.name : `${v.name} (${v.user}@${v.host})`}</option>`).join('')
+  if (d) {
+    $('deploy-modal-title').textContent = 'Edit deployment'
+    for (const [k, val] of Object.entries(d)) {
+      const f = form.elements.namedItem(k)
+      if (f && f.type !== 'checkbox') f.value = val ?? ''
+    }
+    $('deploy-sudo').checked = !!d.useSudo
+    for (const ev of d.envVars || []) addEnvRow(ev.key, ev.value, ev.secret)
+  } else {
+    $('deploy-modal-title').textContent = 'New deployment'
+    form.elements.namedItem('id').value = ''
+    form.elements.namedItem('branch').value = 'main'
+    if (state.selectedId) sel.value = state.selectedId
+  }
+  $('deploy-modal').classList.remove('hidden')
+}
+
+async function submitDeployForm(e) {
+  e.preventDefault()
+  const form = $('deploy-form')
+  const fd = new FormData(form)
+  const d = {
+    id: fd.get('id') || '',
+    name: (fd.get('name') || '').trim(),
+    vpsId: fd.get('vpsId'),
+    repoUrl: (fd.get('repoUrl') || '').trim(),
+    branch: (fd.get('branch') || '').trim() || 'main',
+    path: (fd.get('path') || '').trim(),
+    composeFile: (fd.get('composeFile') || '').trim(),
+    githubToken: fd.get('githubToken') || '',
+    useSudo: $('deploy-sudo').checked,
+    envVars: [],
+  }
+  for (const row of $('deploy-env-rows').children) {
+    const key = row.querySelector('.env-key').value.trim()
+    if (!key) continue
+    d.envVars.push({
+      key,
+      value: row.querySelector('.env-value').value,
+      secret: row.querySelector('.env-secret').checked,
+    })
+  }
+  // Preserve status fields on edit so the card history survives a re-save.
+  const existing = dep.list.find((x) => x.id === d.id)
+  if (existing) {
+    d.lastDeploy = existing.lastDeploy
+    d.lastStatus = existing.lastStatus
+    d.lastCommit = existing.lastCommit
+  }
+  try {
+    await SaveDeployment(d)
+    $('deploy-modal').classList.add('hidden')
+    deployRefresh()
+  } catch (err) {
+    alert('Save failed: ' + errMsg(err))
+  }
+}
+
+async function startDeploy(d) {
+  if (dep.runningId) return
+  dep.runningId = d.id
+  $('deploy-list-view').classList.add('hidden')
+  $('deploy-run-view').classList.remove('hidden')
+  $('deploy-run-title').textContent = `Deploying ${d.name}`
+  const log = $('deploy-log')
+  log.textContent = `⚡ ${d.repoUrl} @ ${d.branch || 'main'} → ${d.path}\n` +
+    (d.useSudo ? '⚡ Sudo: ON\n\n' : '⚡ Sudo: off\n\n')
+  const outcome = $('deploy-outcome')
+  outcome.classList.add('hidden')
+
+  const cleanup = () => {
+    if (dep.logOff) { dep.logOff(); dep.logOff = null }
+    if (dep.doneOff) { dep.doneOff(); dep.doneOff = null }
+    dep.runningId = null
+  }
+  dep.logOff = EventsOn('deploy:log:' + d.id, (line) => {
+    log.textContent += line + '\n'
+    log.scrollTop = log.scrollHeight
+  })
+  dep.doneOff = EventsOn('deploy:done:' + d.id, (errStr) => {
+    if (errStr) {
+      outcome.textContent = '✗ Deploy failed: ' + errStr
+      outcome.className = 'deploy-outcome err'
+    } else {
+      outcome.textContent = '✓ Deploy complete.'
+      outcome.className = 'deploy-outcome ok'
+    }
+    outcome.classList.remove('hidden')
+    cleanup()
+    deployRefresh()
+  })
+
+  try {
+    await RunDeploy(d.id)
+  } catch (e) {
+    outcome.textContent = '✗ Failed to start: ' + errMsg(e)
+    outcome.className = 'deploy-outcome err'
+    outcome.classList.remove('hidden')
+    cleanup()
   }
 }
 
@@ -676,9 +1595,16 @@ async function openShell() {
   $('terminal-placeholder').classList.add('hidden')
   $('terminal').classList.remove('hidden')
   ensureTerm()
+  const desiredPath = state.projectPath || null
 
-  // Already attached to this VPS's shell — just refit and focus.
+  // Already attached to this VPS's shell. If the path context changed (e.g.
+  // switched to another project on the same server, or back to a plain server),
+  // re-root the live shell instead of leaving it in the old directory.
   if (term.vpsId === state.selectedId) {
+    if (term.rootedPath !== desiredPath) {
+      WriteShell(term.vpsId, desiredPath ? `cd ${shQuote(desiredPath)}\n` : `cd ~\n`).catch(() => {})
+      term.rootedPath = desiredPath
+    }
     fitTerm()
     term.inst.focus()
     return
@@ -701,6 +1627,11 @@ async function openShell() {
     term.fit.fit()
     const { cols, rows } = term.inst
     await StartShell(id, cols, rows)
+    // When opened from a project, drop the shell into the deploy path.
+    if (desiredPath) {
+      WriteShell(id, `cd ${shQuote(desiredPath)}\n`).catch(() => {})
+    }
+    term.rootedPath = desiredPath
     term.inst.focus()
   } catch (e) {
     term.inst.write('\r\n\x1b[31mFailed to open shell: ' + errMsg(e) + '\x1b[0m\r\n')
@@ -714,6 +1645,7 @@ async function detachShell() {
   if (term.offExit) { term.offExit(); term.offExit = null }
   const id = term.vpsId
   term.vpsId = null
+  term.rootedPath = null
   if (id) {
     try { await CloseShell(id) } catch {}
   }
@@ -747,7 +1679,9 @@ function migShowStage(name) {
 }
 
 function migPopulateVpsSelects() {
-  const opts = state.vpses.map((v) => `<option value="${v.id}">${v.name} (${v.user}@${v.host})</option>`).join('')
+  // Migration is SSH-to-SSH only — the local machine can't be a source/target.
+  const servers = state.vpses.filter((v) => !v.isLocal)
+  const opts = servers.map((v) => `<option value="${v.id}">${v.name} (${v.user}@${v.host})</option>`).join('')
   for (const id of ['mig-src', 'mig-dst']) {
     const sel = $(id)
     const prev = sel.value
@@ -755,8 +1689,8 @@ function migPopulateVpsSelects() {
     if (prev) sel.value = prev
   }
   // Sensible defaults: source = currently-selected VPS, target = first other.
-  if (state.selectedId) $('mig-src').value = state.selectedId
-  const others = state.vpses.filter((v) => v.id !== $('mig-src').value)
+  if (state.selectedId && !isLocalSel()) $('mig-src').value = state.selectedId
+  const others = servers.filter((v) => v.id !== $('mig-src').value)
   if (others.length && !$('mig-dst').value) $('mig-dst').value = others[0].id
 }
 
@@ -782,10 +1716,8 @@ async function migInspect() {
   if (srcId === dstId) return err('Source and target must be different VPSs.')
   if (!srcPath) return err('Enter the compose directory path on source.')
 
-  // Inspect only touches source — probe sudo there. Target is probed at Run
-  // time so the user doesn't get back-to-back prompts up front.
-  if (useSudo && !(await ensureSudoReady(srcId))) return
-
+  // No password prompting: the SSH users are expected to have passwordless
+  // sudo. If they don't, the command fails and the error is shown as-is.
   $('mig-setup-err').classList.add('hidden')
   const btn = $('mig-inspect')
   btn.disabled = true
@@ -827,7 +1759,7 @@ function migRenderInventory(inv, srcPath, dstPath, composeFile) {
   sections.push(`<h4>Services (${(inv.services || []).length})</h4>`)
   if ((inv.services || []).length) {
     sections.push('<ul>' + inv.services.map((s) =>
-      `<li><strong>${s.name}</strong> — <code>${s.image}</code>${s.isPostgres ? ' <span class="muted">[postgres]</span>' : ''}</li>`
+      `<li><strong>${s.name}</strong> — <code>${s.image || '(built)'}</code>${s.isPostgres ? ' <span class="muted">[postgres]</span>' : ''}${s.builds ? ' <span class="muted">[builds]</span>' : ''}</li>`
     ).join('') + '</ul>')
   } else {
     sections.push('<div class="muted">No services found.</div>')
@@ -845,6 +1777,20 @@ function migRenderInventory(inv, srcPath, dstPath, composeFile) {
   if ((inv.envFiles || []).length) {
     sections.push(`<h4>Env files (${inv.envFiles.length})</h4>`)
     sections.push('<ul>' + inv.envFiles.map((p) => `<li><code>${p}</code></li>`).join('') + '</ul>')
+  }
+
+  if ((inv.externalNetworks || []).length) {
+    sections.push(`<h4>External networks (${inv.externalNetworks.length})</h4>`)
+    sections.push('<ul>' + inv.externalNetworks.map((n) =>
+      `<li><code>${n}</code> <span class="muted">— created on target if missing</span></li>`
+    ).join('') + '</ul>')
+  }
+
+  if ((inv.buildImages || []).length) {
+    sections.push(`<h4>Built images (${inv.buildImages.length})</h4>`)
+    sections.push('<ul>' + inv.buildImages.map((n) =>
+      `<li><code>${n}</code> <span class="muted">— shipped prebuilt (save/load), no rebuild on target</span></li>`
+    ).join('') + '</ul>')
   }
 
   if ((inv.bindMounts || []).length) {
@@ -868,14 +1814,8 @@ async function migRun() {
     composeFile: mig.composeFile,
     volumes: (mig.inventory.volumes || []).map((v) => v.name),
     envFiles: mig.inventory.envFiles || [],
-  }
-
-  // When sudo's on, both VPSes need to be ready before the run starts — the
-  // migration goroutine can't pop modals from the backend. Probe first so we
-  // only prompt for a password when one's actually needed.
-  if (mig.useSudo) {
-    if (!(await ensureSudoReady(srcId))) return
-    if (!(await ensureSudoReady(dstId))) return
+    externalNetworks: mig.inventory.externalNetworks || [],
+    buildImages: mig.inventory.buildImages || [],
   }
 
   mig.running = true
@@ -892,9 +1832,21 @@ async function migRun() {
     : '⚡ Sudo: off — running as the SSH user on both VPSes.\n\n'
 
   // Subscribe before kicking off so early lines aren't missed.
+  // Lines prefixed with a zero-width space are in-place progress updates: they
+  // replace the previous progress line instead of appending, so a transfer
+  // counter ticks in place (terminal-style) rather than flooding the log.
+  const PROG_MARK = '​'
   mig.logOff = EventsOn('migration:log', (line) => {
     const el = $('mig-log')
-    el.textContent += line + '\n'
+    let txt = el.textContent
+    if (txt.endsWith('\n')) {
+      const body = txt.slice(0, -1)
+      const nl = body.lastIndexOf('\n')
+      if (body.slice(nl + 1).startsWith(PROG_MARK)) {
+        txt = txt.slice(0, nl + 1) // drop the prior progress line
+      }
+    }
+    el.textContent = txt + line + '\n'
     el.scrollTop = el.scrollHeight
   })
   mig.doneOff = EventsOn('migration:done', (errStr) => {
@@ -978,10 +1930,24 @@ function toggleAuthFields(type) {
 
 // ─────────── Wire up ───────────
 document.addEventListener('DOMContentLoaded', () => {
-  refreshVPSList()
+  // Load servers before projects: project rows label themselves from the server
+  // list, so rendering them first would show "missing server" until reload.
+  refreshVPSList().then(() => refreshProjects())
+  refreshLocalAvailability()
 
-  // Sidebar
-  $('add-vps-btn').addEventListener('click', () => openModal())
+  // Sidebar: the + button adds whatever the active list shows.
+  $('add-btn').addEventListener('click', () => {
+    if (state.sidebar === 'projects') openProjectModal()
+    else openModal()
+  })
+  document.querySelectorAll('.side-btn').forEach((b) =>
+    b.addEventListener('click', () => switchSidebar(b.dataset.side)))
+
+  // Project modal
+  $('project-cancel').addEventListener('click', () => $('project-modal').classList.add('hidden'))
+  $('project-form').addEventListener('submit', submitProjectForm)
+  $('project-server-mode').addEventListener('change', (e) => toggleProjectServerMode(e.target.value))
+  $('np-authType').addEventListener('change', (e) => toggleNpAuth(e.target.value))
 
   // Modal
   $('modal-cancel').addEventListener('click', closeModal)
@@ -1059,6 +2025,48 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Docker
   $('docker-refresh').addEventListener('click', loadContainers)
+  $('docker-all').addEventListener('change', (e) => { state.dockerShowAll = e.target.checked; loadContainers() })
+
+  // Databases
+  $('db-refresh').addEventListener('click', dbLoadContainers)
+  $('db-sudo').addEventListener('change', dbLoadContainers)
+  $('db-all').addEventListener('change', (e) => { state.dbShowAll = e.target.checked; dbLoadContainers() })
+  $('db-container').addEventListener('change', (e) => {
+    dbs.containerId = e.target.value
+    dbs.database = null
+    dbLoadDatabases()
+  })
+  $('db-database').addEventListener('change', (e) => {
+    dbs.database = e.target.value
+    dbs.table = null
+    dbLoadTables()
+  })
+  $('db-mode-tables').addEventListener('click', () => { dbs.mode = 'tables'; dbShowMode() })
+  $('db-mode-sql').addEventListener('click', () => { dbs.mode = 'sql'; dbShowMode() })
+  $('db-prev').addEventListener('click', () => {
+    if (dbs.page > 0) { dbs.page--; dbLoadRows() }
+  })
+  $('db-next').addEventListener('click', () => {
+    if ((dbs.page + 1) * dbs.pageSize < dbs.total) { dbs.page++; dbLoadRows() }
+  })
+  $('db-insert').addEventListener('click', () => openRowModal('insert'))
+  $('db-row-cancel').addEventListener('click', closeRowModal)
+  $('db-row-form').addEventListener('submit', submitRowModal)
+  $('db-sql-run').addEventListener('click', dbRunSQL)
+  $('db-sql-input').addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); dbRunSQL() }
+  })
+
+  // Deploy
+  $('deploy-add').addEventListener('click', () => openDeployModal())
+  $('deploy-cancel').addEventListener('click', () => $('deploy-modal').classList.add('hidden'))
+  $('deploy-form').addEventListener('submit', submitDeployForm)
+  $('deploy-env-add').addEventListener('click', () => addEnvRow())
+  $('deploy-run-back').addEventListener('click', () => {
+    $('deploy-run-view').classList.add('hidden')
+    $('deploy-list-view').classList.remove('hidden')
+    deployRefresh()
+  })
 
   // Migration
   $('mig-inspect').addEventListener('click', migInspect)
@@ -1066,9 +2074,9 @@ document.addEventListener('DOMContentLoaded', () => {
   $('mig-run').addEventListener('click', migRun)
   $('mig-reset').addEventListener('click', () => migShowStage('setup'))
   $('mig-src').addEventListener('change', () => {
-    // Avoid src == dst — pick a different target if needed.
+    // Avoid src == dst — pick a different (non-local) target if needed.
     if ($('mig-src').value === $('mig-dst').value) {
-      const other = state.vpses.find((v) => v.id !== $('mig-src').value)
+      const other = state.vpses.find((v) => !v.isLocal && v.id !== $('mig-src').value)
       if (other) $('mig-dst').value = other.id
     }
   })

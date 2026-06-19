@@ -55,7 +55,17 @@ func List(sshClient *ssh.Client, dir string) ([]FileInfo, error) {
 	return files, nil
 }
 
+// ProgressFn is invoked periodically during a transfer with the bytes copied so
+// far and the total size (0 if unknown). It must not block for long — it's
+// called on the copy goroutine. May be nil.
+type ProgressFn func(done, total int64)
+
 func Download(sshClient *ssh.Client, remotePath, localPath string) error {
+	return DownloadProgress(sshClient, remotePath, localPath, nil)
+}
+
+// DownloadProgress is Download with periodic progress callbacks.
+func DownloadProgress(sshClient *ssh.Client, remotePath, localPath string, onProgress ProgressFn) error {
 	c, err := newClient(sshClient)
 	if err != nil {
 		return err
@@ -68,19 +78,29 @@ func Download(sshClient *ssh.Client, remotePath, localPath string) error {
 	}
 	defer src.Close()
 
+	var total int64
+	if info, err := c.Stat(remotePath); err == nil {
+		total = info.Size()
+	}
+
 	dst, err := os.Create(localPath)
 	if err != nil {
 		return fmt.Errorf("create local: %w", err)
 	}
 	defer dst.Close()
 
-	if _, err := io.Copy(dst, src); err != nil {
+	if err := copyProgress(dst, src, total, onProgress); err != nil {
 		return fmt.Errorf("copy: %w", err)
 	}
 	return nil
 }
 
 func Upload(sshClient *ssh.Client, localPath, remotePath string) error {
+	return UploadProgress(sshClient, localPath, remotePath, nil)
+}
+
+// UploadProgress is Upload with periodic progress callbacks.
+func UploadProgress(sshClient *ssh.Client, localPath, remotePath string, onProgress ProgressFn) error {
 	c, err := newClient(sshClient)
 	if err != nil {
 		return err
@@ -93,16 +113,55 @@ func Upload(sshClient *ssh.Client, localPath, remotePath string) error {
 	}
 	defer src.Close()
 
+	var total int64
+	if info, err := src.Stat(); err == nil {
+		total = info.Size()
+	}
+
 	dst, err := c.Create(remotePath)
 	if err != nil {
 		return fmt.Errorf("create remote: %w", err)
 	}
 	defer dst.Close()
 
-	if _, err := io.Copy(dst, src); err != nil {
+	if err := copyProgress(dst, src, total, onProgress); err != nil {
 		return fmt.Errorf("copy: %w", err)
 	}
 	return nil
+}
+
+// copyProgress copies src→dst, invoking onProgress at most every few MB (and
+// once at the end). With a nil callback it's a plain io.Copy.
+func copyProgress(dst io.Writer, src io.Reader, total int64, onProgress ProgressFn) error {
+	if onProgress == nil {
+		_, err := io.Copy(dst, src)
+		return err
+	}
+	pw := &progressWriter{w: dst, total: total, step: 4 * 1024 * 1024, onProgress: onProgress}
+	_, err := io.Copy(pw, src)
+	if err == nil {
+		onProgress(pw.done, total) // final tick so the UI lands on 100%
+	}
+	return err
+}
+
+type progressWriter struct {
+	w          io.Writer
+	total      int64
+	done       int64
+	lastEmit   int64
+	step       int64
+	onProgress ProgressFn
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	p.done += int64(n)
+	if p.done-p.lastEmit >= p.step {
+		p.lastEmit = p.done
+		p.onProgress(p.done, p.total)
+	}
+	return n, err
 }
 
 const maxEditBytes = 512 * 1024 // 512 KB

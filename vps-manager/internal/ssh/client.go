@@ -235,6 +235,81 @@ func (c *Connection) ExecWithStdin(ctx context.Context, cmd, stdin string) (*Exe
 	}
 }
 
+// ExecStream runs cmd and invokes onOutput with chunks of combined
+// stdout+stderr as they arrive, instead of buffering until exit. Used for
+// long-running commands whose progress the user wants to watch (docker builds,
+// compose up). Returns the remote exit code.
+func (c *Connection) ExecStream(ctx context.Context, cmd string, onOutput func(string)) (int, error) {
+	session, err := c.Client.NewSession()
+	if err != nil {
+		return -1, fmt.Errorf("new session: %w", err)
+	}
+	defer session.Close()
+
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		return -1, fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderr, err := session.StderrPipe()
+	if err != nil {
+		return -1, fmt.Errorf("stderr pipe: %w", err)
+	}
+
+	if err := session.Start(cmd); err != nil {
+		return -1, fmt.Errorf("start: %w", err)
+	}
+
+	var outMu sync.Mutex
+	emit := func(b []byte) {
+		if len(b) == 0 || onOutput == nil {
+			return
+		}
+		outMu.Lock()
+		onOutput(string(b))
+		outMu.Unlock()
+	}
+	var wg sync.WaitGroup
+	for _, r := range []io.Reader{stdout, stderr} {
+		wg.Add(1)
+		go func(r io.Reader) {
+			defer wg.Done()
+			buf := make([]byte, 16*1024)
+			for {
+				n, readErr := r.Read(buf)
+				if n > 0 {
+					chunk := make([]byte, n)
+					copy(chunk, buf[:n])
+					emit(chunk)
+				}
+				if readErr != nil {
+					return
+				}
+			}
+		}(r)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		wg.Wait()
+		done <- session.Wait()
+	}()
+
+	select {
+	case <-ctx.Done():
+		_ = session.Signal(ssh.SIGKILL)
+		<-done
+		return -1, ctx.Err()
+	case err := <-done:
+		if err == nil {
+			return 0, nil
+		}
+		if exitErr, ok := err.(*ssh.ExitError); ok {
+			return exitErr.ExitStatus(), nil
+		}
+		return -1, err
+	}
+}
+
 // Session is a live interactive shell backed by a PTY on the remote host.
 // Unlike Exec (one-shot, stateless), a Session is long-lived: the remote shell
 // keeps its working directory, environment, and any foreground program (psql,

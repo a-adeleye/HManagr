@@ -10,10 +10,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vps-manager/internal/config"
+	"vps-manager/internal/db"
+	"vps-manager/internal/deploy"
 	"vps-manager/internal/docker"
+	"vps-manager/internal/local"
 	"vps-manager/internal/migration"
 	"vps-manager/internal/sftp"
 	sshpkg "vps-manager/internal/ssh"
@@ -35,6 +39,32 @@ type App struct {
 	// cleared on Disconnect / DeleteVPS / shutdown. Never persisted.
 	sudoMu        sync.Mutex
 	sudoPasswords map[string]string
+
+	// dbCache holds detected DB containers (incl. sniffed credentials, which
+	// never leave the backend) keyed by vpsID+"\x00"+containerID. Refreshed on
+	// every ListDBContainers, dropped on Disconnect.
+	dbMu    sync.Mutex
+	dbCache map[string]*db.Container
+
+	// local is the host-shell executor for the virtual "Local" environment. It
+	// is nil if no POSIX shell was found on the host; localReady flips true once
+	// the user "connects" (which runs a docker preflight). localReady is atomic
+	// because Wails dispatches each bound method on its own goroutine, so
+	// Connect/Disconnect (writers) and IsConnected (reader) can overlap.
+	local      *local.Shell
+	localErr   error
+	localReady atomic.Bool
+}
+
+// LocalID is the reserved VPS id for the virtual "this machine" environment.
+// Commands for it run on the host shell instead of over SSH.
+const LocalID = "local"
+
+func isLocal(id string) bool { return id == LocalID }
+
+// localVPS is the synthetic sidebar entry for local management.
+func localVPS() config.VPS {
+	return config.VPS{ID: LocalID, Name: "Local (this machine)", IsLocal: true}
 }
 
 func NewApp() *App {
@@ -42,6 +72,7 @@ func NewApp() *App {
 		pool:          sshpkg.NewPool(),
 		shells:        make(map[string]*sshpkg.Session),
 		sudoPasswords: make(map[string]string),
+		dbCache:       make(map[string]*db.Container),
 	}
 }
 
@@ -53,6 +84,13 @@ func (a *App) startup(ctx context.Context) {
 		panic(err)
 	}
 	a.store = store
+	// Locate a host shell for local mode. A failure here isn't fatal — it just
+	// means local mode is unavailable, surfaced when the user tries to use it.
+	if sh, err := local.NewShell(); err != nil {
+		a.localErr = err
+	} else {
+		a.local = sh
+	}
 }
 
 func (a *App) shutdown(ctx context.Context) {
@@ -72,28 +110,113 @@ func (a *App) shutdown(ctx context.Context) {
 
 // ───────── VPS config CRUD ─────────
 
+// ListVPS returns the saved servers with the virtual Local entry prepended, so
+// "this machine" always appears first in the sidebar.
 func (a *App) ListVPS() []config.VPS {
-	return a.store.List()
+	return append([]config.VPS{localVPS()}, a.store.List()...)
+}
+
+// LocalAvailable reports whether local mode can be used (a host shell exists);
+// when false, the reason explains what's missing (e.g. no bash on Windows).
+func (a *App) LocalAvailable() bool { return a.local != nil }
+
+func (a *App) LocalUnavailableReason() string {
+	if a.localErr != nil {
+		return a.localErr.Error()
+	}
+	return ""
 }
 
 func (a *App) AddVPS(v config.VPS) error {
-	return a.store.Add(v)
+	if isLocal(v.ID) {
+		return fmt.Errorf("the local environment cannot be added or edited")
+	}
+	_, err := a.store.Add(v)
+	return err
 }
 
 func (a *App) UpdateVPS(v config.VPS) error {
+	if isLocal(v.ID) {
+		return fmt.Errorf("the local environment cannot be edited")
+	}
 	return a.store.Update(v)
 }
 
 func (a *App) DeleteVPS(id string) error {
+	if isLocal(id) {
+		return fmt.Errorf("the local environment cannot be deleted")
+	}
 	a.closeShell(id)
 	a.ClearSudoPassword(id)
 	_ = a.pool.Disconnect(id)
 	return a.store.Delete(id)
 }
 
+// ───────── Projects ─────────
+//
+// A project is a named server+path bookmark. Selecting one connects to its
+// server (reusing a live connection) and roots the session at the deploy path.
+
+func (a *App) ListProjects() []config.Project {
+	return a.store.ListProjects()
+}
+
+// SaveProject inserts or updates a project. When p.VPSID is empty, newServer is
+// treated as inline server details: a new server is created and the project is
+// linked to it (so the same server also appears in the Servers list). When
+// p.VPSID is set, newServer is ignored and the existing server is used.
+func (a *App) SaveProject(p config.Project, newServer config.VPS) (config.Project, error) {
+	if strings.TrimSpace(p.Name) == "" || strings.TrimSpace(p.Path) == "" {
+		return config.Project{}, fmt.Errorf("project name and deploy path are required")
+	}
+	if p.VPSID == "" {
+		if strings.TrimSpace(newServer.Host) == "" {
+			return config.Project{}, fmt.Errorf("choose an existing server or enter server details")
+		}
+		v, err := a.store.Add(newServer)
+		if err != nil {
+			return config.Project{}, err
+		}
+		p.VPSID = v.ID
+		saved, err := a.store.SaveProject(p)
+		if err != nil {
+			// The server was already persisted; don't leave it orphaned with no
+			// project pointing at it if the project save then failed.
+			_ = a.store.Delete(v.ID)
+			return config.Project{}, err
+		}
+		return saved, nil
+	}
+	if !isLocal(p.VPSID) {
+		if _, ok := a.store.Get(p.VPSID); !ok {
+			return config.Project{}, fmt.Errorf("the selected server no longer exists")
+		}
+	}
+	return a.store.SaveProject(p)
+}
+
+func (a *App) DeleteProject(id string) error {
+	return a.store.DeleteProject(id)
+}
+
 // ───────── Connection lifecycle ─────────
 
 func (a *App) Connect(id string) error {
+	if isLocal(id) {
+		if a.local == nil {
+			if a.localErr != nil {
+				return a.localErr
+			}
+			return fmt.Errorf("local mode is unavailable on this machine")
+		}
+		ctx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
+		defer cancel()
+		if err := a.local.Preflight(ctx); err != nil {
+			return fmt.Errorf("docker not reachable locally: %w", err)
+		}
+		a.localReady.Store(true)
+		return nil
+	}
 	v, ok := a.store.Get(id)
 	if !ok {
 		return fmt.Errorf("vps %s not found", id)
@@ -110,18 +233,36 @@ func (a *App) Connect(id string) error {
 }
 
 func (a *App) Disconnect(id string) error {
+	a.dropDBCache(id)
+	if isLocal(id) {
+		a.localReady.Store(false)
+		return nil
+	}
 	a.closeShell(id)
 	a.ClearSudoPassword(id)
 	return a.pool.Disconnect(id)
 }
 
 func (a *App) IsConnected(id string) bool {
+	if isLocal(id) {
+		return a.localReady.Load()
+	}
 	return a.pool.IsConnected(id)
 }
 
 // ───────── Files ─────────
 
+// LocalStartDir is the directory the file browser opens to in local mode
+// (the user's home), forward-slashed so the frontend's "/" path logic works.
+func (a *App) LocalStartDir() string { return local.HomeDir() }
+
 func (a *App) ListFiles(id, dir string) ([]sftp.FileInfo, error) {
+	if isLocal(id) {
+		if dir == "" {
+			dir = local.HomeDir()
+		}
+		return local.List(dir)
+	}
 	conn, err := a.pool.Get(id)
 	if err != nil {
 		return nil, err
@@ -133,6 +274,9 @@ func (a *App) ListFiles(id, dir string) ([]sftp.FileInfo, error) {
 }
 
 func (a *App) DownloadFile(id, remotePath, localPath string) error {
+	if isLocal(id) {
+		return local.Download(remotePath, localPath)
+	}
 	conn, err := a.pool.Get(id)
 	if err != nil {
 		return err
@@ -141,6 +285,9 @@ func (a *App) DownloadFile(id, remotePath, localPath string) error {
 }
 
 func (a *App) UploadFile(id, localPath, remotePath string) error {
+	if isLocal(id) {
+		return local.Upload(localPath, remotePath)
+	}
 	conn, err := a.pool.Get(id)
 	if err != nil {
 		return err
@@ -149,6 +296,9 @@ func (a *App) UploadFile(id, localPath, remotePath string) error {
 }
 
 func (a *App) ReadRemoteFile(id, remotePath string) (string, error) {
+	if isLocal(id) {
+		return local.ReadFile(remotePath)
+	}
 	conn, err := a.pool.Get(id)
 	if err != nil {
 		return "", err
@@ -157,6 +307,9 @@ func (a *App) ReadRemoteFile(id, remotePath string) (string, error) {
 }
 
 func (a *App) WriteRemoteFile(id, remotePath, content string) error {
+	if isLocal(id) {
+		return local.WriteFile(remotePath, content)
+	}
 	conn, err := a.pool.Get(id)
 	if err != nil {
 		return err
@@ -165,6 +318,9 @@ func (a *App) WriteRemoteFile(id, remotePath, content string) error {
 }
 
 func (a *App) DeleteRemoteFile(id, path string) error {
+	if isLocal(id) {
+		return local.Delete(path)
+	}
 	conn, err := a.pool.Get(id)
 	if err != nil {
 		return err
@@ -172,10 +328,13 @@ func (a *App) DeleteRemoteFile(id, path string) error {
 	return sftp.Delete(conn.Client, path)
 }
 
-// MakeDir creates a directory on the remote host (mkdir -p semantics). If
-// useSudo is true, the call shells out to `sudo mkdir -p` instead of going
-// through SFTP, since SFTP has no way to elevate.
+// MakeDir creates a directory (mkdir -p semantics). On a remote host with
+// useSudo it shells out to `sudo mkdir -p` (SFTP can't elevate); locally it
+// uses the native filesystem and ignores useSudo.
 func (a *App) MakeDir(id, path string, useSudo bool) error {
+	if isLocal(id) {
+		return local.Mkdir(path)
+	}
 	if useSudo {
 		res, err := a.execAsSudo(id, "mkdir -p "+shellQuote(path))
 		return sudoErr(res, err)
@@ -213,53 +372,6 @@ func (a *App) ClearSudoPassword(id string) {
 	delete(a.sudoPasswords, id)
 }
 
-// ProbeSudo reports whether sudo on this VPS will work without a password
-// prompt right now. Used by the migration wizard so it can avoid asking for a
-// password when one isn't actually needed (NOPASSWD or already-cached).
-//
-// Returns one of:
-//
-//	"ok"       — sudo runs non-interactively (NOPASSWD or a working cached pw)
-//	"password" — a password is required and we don't have a valid one cached
-//	"denied"   — this user isn't in sudoers at all
-func (a *App) ProbeSudo(id string) (string, error) {
-	conn, err := a.pool.Get(id)
-	if err != nil {
-		return "", err
-	}
-	ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
-	defer cancel()
-
-	a.sudoMu.Lock()
-	pwd, hasPwd := a.sudoPasswords[id]
-	a.sudoMu.Unlock()
-
-	if hasPwd {
-		res, err := conn.ExecWithStdin(ctx, "sudo -S -p '' true", pwd+"\n")
-		if err == nil && res.ExitCode == 0 {
-			return "ok", nil
-		}
-		// Cached password no longer works — fall through to a clean probe so
-		// "denied" can still be distinguished from "password".
-		a.sudoMu.Lock()
-		delete(a.sudoPasswords, id)
-		a.sudoMu.Unlock()
-	}
-
-	res, err := conn.Exec(ctx, "sudo -n true")
-	if err != nil {
-		return "", err
-	}
-	if res.ExitCode == 0 {
-		return "ok", nil
-	}
-	out := strings.ToLower(res.Stdout + " " + res.Stderr)
-	if strings.Contains(out, "not in the sudoers") || strings.Contains(out, "not allowed to execute") {
-		return "denied", nil
-	}
-	return "password", nil
-}
-
 // execAsSudo prefixes cmd with sudo using a 30s timeout (the default for one-
 // off quick commands like mkdir / chmod). For long-running operations supply
 // your own context via execAsSudoCtx.
@@ -277,20 +389,40 @@ func (a *App) execAsSudoCtx(ctx context.Context, id, cmd string) (*sshpkg.ExecRe
 	if err != nil {
 		return nil, err
 	}
+	// Connecting as root already has full privileges — and minimal images
+	// often don't ship sudo at all — so skip the prefix entirely.
+	if v, ok := a.store.Get(id); ok && v.User == "root" {
+		return conn.Exec(ctx, cmd)
+	}
+	// Elevate the whole line under one shell. Without this, compound commands
+	// like `cd X && docker compose stop` would elevate only the first word
+	// (`sudo cd …`), which both fails and leaves the part that actually
+	// needed root running unprivileged.
+	wrapped := "sh -c " + shellQuote(cmd)
 	a.sudoMu.Lock()
 	pwd, hasPwd := a.sudoPasswords[id]
 	a.sudoMu.Unlock()
 	if hasPwd {
-		return conn.ExecWithStdin(ctx, "sudo -S -p '' "+cmd, pwd+"\n")
+		return conn.ExecWithStdin(ctx, "sudo -S -p '' "+wrapped, pwd+"\n")
 	}
-	return conn.Exec(ctx, "sudo -n "+cmd)
+	return conn.Exec(ctx, "sudo -n "+wrapped)
 }
 
-// execFn returns a migration.ExecFn that runs commands on the given VPS,
-// optionally wrapped with sudo. The returned function is safe to call across
-// goroutine boundaries — it re-resolves the connection from the pool each
-// call, so it survives transient reconnects.
-func (a *App) execFn(id string, useSudo bool) migration.ExecFn {
+// execFn returns an exec function that runs commands on the given VPS,
+// optionally wrapped with sudo. The unnamed func type is assignable to
+// migration.ExecFn, db.ExecFn, and deploy.ExecFn alike. The returned function
+// is safe to call across goroutine boundaries — it re-resolves the connection
+// from the pool each call, so it survives transient reconnects.
+func (a *App) execFn(id string, useSudo bool) func(context.Context, string) (*sshpkg.ExecResult, error) {
+	if isLocal(id) {
+		// Local mode has no sudo concept — commands run as the desktop user.
+		return func(ctx context.Context, cmd string) (*sshpkg.ExecResult, error) {
+			if a.local == nil {
+				return nil, fmt.Errorf("local mode is unavailable on this machine")
+			}
+			return a.local.Exec(ctx, cmd)
+		}
+	}
 	if useSudo {
 		return func(ctx context.Context, cmd string) (*sshpkg.ExecResult, error) {
 			return a.execAsSudoCtx(ctx, id, cmd)
@@ -350,6 +482,13 @@ type PathInfo struct {
 // group names are resolved via getent over SSH; if that fails the numeric IDs
 // are still returned.
 func (a *App) StatRemoteFile(id, p string) (*PathInfo, error) {
+	if isLocal(id) {
+		st, err := local.Stat(p)
+		if err != nil {
+			return nil, err
+		}
+		return &PathInfo{Mode: st.Mode, IsDir: st.IsDir}, nil
+	}
 	conn, err := a.pool.Get(id)
 	if err != nil {
 		return nil, err
@@ -387,6 +526,9 @@ func (a *App) ChmodRemoteFile(id, p, mode string, useSudo bool) error {
 	if err != nil {
 		return fmt.Errorf("invalid mode (use octal like 755): %w", err)
 	}
+	if isLocal(id) {
+		return local.Chmod(p, os.FileMode(m))
+	}
 	if useSudo {
 		res, err := a.execAsSudo(id, fmt.Sprintf("chmod %o %s", m, shellQuote(p)))
 		return sudoErr(res, err)
@@ -406,6 +548,9 @@ func (a *App) ChownRemoteFile(id, p, owner, group string, useSudo bool) error {
 	group = strings.TrimSpace(group)
 	if owner == "" && group == "" {
 		return nil
+	}
+	if isLocal(id) {
+		return fmt.Errorf("changing owner/group isn't supported in local mode")
 	}
 
 	if useSudo {
@@ -516,14 +661,12 @@ func (a *App) ChooseOpenPath() (string, error) {
 
 // ───────── Docker ─────────
 
-func (a *App) ListContainers(id string) ([]docker.Container, error) {
-	conn, err := a.pool.Get(id)
-	if err != nil {
-		return nil, err
-	}
+// ListContainers lists the server's containers. When deployPath is non-empty
+// (the active project's path), the list is scoped to that compose project.
+func (a *App) ListContainers(id, deployPath string) ([]docker.Container, error) {
 	ctx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
 	defer cancel()
-	return docker.List(ctx, conn)
+	return docker.List(ctx, a.execFn(id, false), docker.ComposeWorkingDirFilter(deployPath))
 }
 
 func (a *App) RestartContainer(id, containerID string) error {
@@ -539,34 +682,27 @@ func (a *App) StartContainer(id, containerID string) error {
 }
 
 func (a *App) containerAction(id, action, containerID string) error {
-	conn, err := a.pool.Get(id)
-	if err != nil {
-		return err
-	}
 	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
 	defer cancel()
+	exec := a.execFn(id, false)
 	switch action {
 	case "restart":
-		return docker.Restart(ctx, conn, containerID)
+		return docker.Restart(ctx, exec, containerID)
 	case "stop":
-		return docker.Stop(ctx, conn, containerID)
+		return docker.Stop(ctx, exec, containerID)
 	case "start":
-		return docker.Start(ctx, conn, containerID)
+		return docker.Start(ctx, exec, containerID)
 	}
 	return fmt.Errorf("unknown action: %s", action)
 }
 
 func (a *App) ContainerLogs(id, containerID string, tail int) (string, error) {
-	conn, err := a.pool.Get(id)
-	if err != nil {
-		return "", err
-	}
 	ctx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
 	defer cancel()
 	if tail <= 0 {
 		tail = 200
 	}
-	return docker.Logs(ctx, conn, containerID, tail)
+	return docker.Logs(ctx, a.execFn(id, false), containerID, tail)
 }
 
 // ───────── Shell commands ─────────
@@ -578,13 +714,9 @@ type CommandResult struct {
 }
 
 func (a *App) RunCommand(id, cmd string) (*CommandResult, error) {
-	conn, err := a.pool.Get(id)
-	if err != nil {
-		return nil, err
-	}
 	ctx, cancel := context.WithTimeout(a.ctx, 60*time.Second)
 	defer cancel()
-	res, err := conn.Exec(ctx, cmd)
+	res, err := a.execFn(id, false)(ctx, cmd)
 	if err != nil {
 		return nil, err
 	}
@@ -612,6 +744,11 @@ func (a *App) RunCommand(id, cmd string) (*CommandResult, error) {
 // StartShell opens an interactive PTY shell for the VPS and begins streaming its
 // output. If a shell already exists for this id, it is closed and replaced.
 func (a *App) StartShell(id string, cols, rows int) error {
+	if isLocal(id) {
+		// A real local PTY needs ConPTY plumbing we don't ship; the local
+		// environment is for Docker/DB/Deploy/Files, not an interactive shell.
+		return fmt.Errorf("the interactive terminal isn't available in local mode — use your own terminal on this machine")
+	}
 	conn, err := a.pool.Get(id)
 	if err != nil {
 		return err
@@ -725,6 +862,9 @@ func (a *App) InspectMigration(id, sourcePath string, useSudo bool) (*migration.
 // outcome ("" on success, an error string otherwise). The call itself returns
 // as soon as the goroutine is launched.
 func (a *App) RunMigration(srcID, dstID string, opts migration.RunOptions, useSudo bool) error {
+	if isLocal(srcID) || isLocal(dstID) {
+		return fmt.Errorf("migration runs between two SSH servers; the local environment can't be a source or target")
+	}
 	src, err := a.pool.Get(srcID)
 	if err != nil {
 		return fmt.Errorf("source: %w", err)
@@ -749,6 +889,255 @@ func (a *App) RunMigration(srcID, dstID string, opts migration.RunOptions, useSu
 	return nil
 }
 
+// ───────── Databases ─────────
+//
+// The DB manager talks to database engines running inside docker containers
+// via `docker exec` + the engine CLI (see internal/db). The frontend only ever
+// holds container IDs; credentials are sniffed from the container environment
+// and cached backend-side.
+
+// ListDBContainers discovers database containers on the VPS and refreshes the
+// credential cache for them. When deployPath is non-empty (active project), the
+// list is scoped to that compose project's containers.
+func (a *App) ListDBContainers(id string, useSudo bool, deployPath string) ([]db.Container, error) {
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	list, err := db.ListContainers(ctx, a.execFn(id, useSudo), docker.ComposeWorkingDirFilter(deployPath))
+	if err != nil {
+		return nil, err
+	}
+	a.dbMu.Lock()
+	for i := range list {
+		c := list[i]
+		a.dbCache[id+"\x00"+c.ID] = &c
+	}
+	a.dbMu.Unlock()
+	return list, nil
+}
+
+// dbContainer resolves a cached container, re-listing once if the cache is
+// cold (e.g. after an app restart while the UI kept its state).
+func (a *App) dbContainer(vpsID, containerID string, useSudo bool) (*db.Container, error) {
+	a.dbMu.Lock()
+	c, ok := a.dbCache[vpsID+"\x00"+containerID]
+	a.dbMu.Unlock()
+	if ok {
+		return c, nil
+	}
+	// Cold cache: re-list unscoped so the container is found regardless of any
+	// project filter active in the UI.
+	if _, err := a.ListDBContainers(vpsID, useSudo, ""); err != nil {
+		return nil, err
+	}
+	a.dbMu.Lock()
+	c, ok = a.dbCache[vpsID+"\x00"+containerID]
+	a.dbMu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("container %s not found on this VPS", containerID)
+	}
+	return c, nil
+}
+
+func (a *App) dropDBCache(vpsID string) {
+	a.dbMu.Lock()
+	for k := range a.dbCache {
+		if strings.HasPrefix(k, vpsID+"\x00") {
+			delete(a.dbCache, k)
+		}
+	}
+	a.dbMu.Unlock()
+}
+
+func (a *App) DBListDatabases(vpsID, containerID string, useSudo bool) ([]string, error) {
+	c, err := a.dbContainer(vpsID, containerID, useSudo)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	return db.ListDatabases(ctx, a.execFn(vpsID, useSudo), c)
+}
+
+func (a *App) DBListTables(vpsID, containerID, dbName string, useSudo bool) ([]db.Table, error) {
+	c, err := a.dbContainer(vpsID, containerID, useSudo)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	return db.ListTables(ctx, a.execFn(vpsID, useSudo), c, dbName)
+}
+
+func (a *App) DBTableColumns(vpsID, containerID, dbName, schema, table string, useSudo bool) ([]db.Column, error) {
+	c, err := a.dbContainer(vpsID, containerID, useSudo)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	return db.TableColumns(ctx, a.execFn(vpsID, useSudo), c, dbName, schema, table)
+}
+
+func (a *App) DBTableRows(vpsID, containerID, dbName, schema, table string, limit, offset int, useSudo bool) (*db.QueryResult, error) {
+	c, err := a.dbContainer(vpsID, containerID, useSudo)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 60*time.Second)
+	defer cancel()
+	return db.TableRows(ctx, a.execFn(vpsID, useSudo), c, dbName, schema, table, limit, offset)
+}
+
+func (a *App) DBQuery(vpsID, containerID, dbName, sql string, useSudo bool) (*db.QueryResult, error) {
+	c, err := a.dbContainer(vpsID, containerID, useSudo)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 120*time.Second)
+	defer cancel()
+	return db.Query(ctx, a.execFn(vpsID, useSudo), c, dbName, sql)
+}
+
+func (a *App) DBInsertRow(vpsID, containerID, dbName, schema, table string, values map[string]*string, useSudo bool) (string, error) {
+	c, err := a.dbContainer(vpsID, containerID, useSudo)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	return db.InsertRow(ctx, a.execFn(vpsID, useSudo), c, dbName, schema, table, values)
+}
+
+func (a *App) DBUpdateRow(vpsID, containerID, dbName, schema, table string, pk, values map[string]*string, useSudo bool) (string, error) {
+	c, err := a.dbContainer(vpsID, containerID, useSudo)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	return db.UpdateRow(ctx, a.execFn(vpsID, useSudo), c, dbName, schema, table, pk, values)
+}
+
+func (a *App) DBDeleteRow(vpsID, containerID, dbName, schema, table string, pk map[string]*string, useSudo bool) (string, error) {
+	c, err := a.dbContainer(vpsID, containerID, useSudo)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	return db.DeleteRow(ctx, a.execFn(vpsID, useSudo), c, dbName, schema, table, pk)
+}
+
+// ───────── Deployments ─────────
+//
+// Deploy a GitHub repo to a VPS with docker compose. Definitions persist in
+// the config store; each run streams its log through "deploy:log:<id>" and
+// finishes with "deploy:done:<id>" ("" on success, error string otherwise).
+
+func (a *App) ListDeployments() []config.Deployment {
+	return a.store.ListDeployments()
+}
+
+func (a *App) SaveDeployment(d config.Deployment) (config.Deployment, error) {
+	if strings.TrimSpace(d.Name) == "" || strings.TrimSpace(d.RepoURL) == "" ||
+		strings.TrimSpace(d.Path) == "" || d.VPSID == "" {
+		return config.Deployment{}, fmt.Errorf("name, VPS, repo URL and path are required")
+	}
+	return a.store.SaveDeployment(d)
+}
+
+func (a *App) DeleteDeployment(id string) error {
+	return a.store.DeleteDeployment(id)
+}
+
+// streamFn mirrors execFn for streaming commands, applying the same sudo
+// policy (skip for root, non-interactive `sudo -n` otherwise — failures
+// surface as-is, no password prompting).
+func (a *App) streamFn(id string, useSudo bool) deploy.StreamFn {
+	if isLocal(id) {
+		return func(ctx context.Context, cmd string, onOutput func(string)) (int, error) {
+			if a.local == nil {
+				return -1, fmt.Errorf("local mode is unavailable on this machine")
+			}
+			return a.local.ExecStream(ctx, cmd, onOutput)
+		}
+	}
+	return func(ctx context.Context, cmd string, onOutput func(string)) (int, error) {
+		conn, err := a.pool.Get(id)
+		if err != nil {
+			return -1, err
+		}
+		full := cmd
+		if useSudo {
+			if v, ok := a.store.Get(id); !ok || v.User != "root" {
+				full = "sudo -n sh -c " + shellQuote(cmd)
+			}
+		}
+		return conn.ExecStream(ctx, full, onOutput)
+	}
+}
+
+// RunDeploy starts a deploy in a goroutine. Auto-connects the target VPS if
+// needed so a deploy is one click from a cold start.
+func (a *App) RunDeploy(deployID string) error {
+	d, ok := a.store.GetDeployment(deployID)
+	if !ok {
+		return fmt.Errorf("deployment %s not found", deployID)
+	}
+	if isLocal(d.VPSID) {
+		if err := a.Connect(LocalID); err != nil {
+			return err
+		}
+	} else {
+		if _, ok := a.store.Get(d.VPSID); !ok {
+			return fmt.Errorf("the VPS for this deployment no longer exists")
+		}
+		if !a.pool.IsConnected(d.VPSID) {
+			if err := a.Connect(d.VPSID); err != nil {
+				return fmt.Errorf("connect: %w", err)
+			}
+		}
+	}
+
+	exec := a.execFn(d.VPSID, d.UseSudo)
+	stream := a.streamFn(d.VPSID, d.UseSudo)
+	a.store.SetDeployStatus(d.ID, "running", "", time.Now().Format(time.RFC3339))
+
+	// Local deploys write .env natively to dodge Git Bash's CR-stripping.
+	var writeFile func(string, string) error
+	if isLocal(d.VPSID) {
+		writeFile = func(p, content string) error {
+			if err := local.WriteFile(p, content); err != nil {
+				return err
+			}
+			_ = os.Chmod(p, 0o600) // best-effort; a no-op on Windows ACLs
+			return nil
+		}
+	}
+
+	go func() {
+		log := func(line string) {
+			wailsruntime.EventsEmit(a.ctx, "deploy:log:"+d.ID, line)
+		}
+		commit, err := deploy.Run(a.ctx, exec, stream, deploy.Options{
+			RepoURL:     d.RepoURL,
+			Branch:      d.Branch,
+			Path:        d.Path,
+			ComposeFile: d.ComposeFile,
+			Token:       d.GithubToken,
+			EnvVars:     d.EnvVars,
+			WriteFile:   writeFile,
+		}, log)
+		status, msg := "success", ""
+		if err != nil {
+			status, msg = "failed", err.Error()
+		}
+		a.store.SetDeployStatus(d.ID, status, commit, time.Now().Format(time.RFC3339))
+		wailsruntime.EventsEmit(a.ctx, "deploy:done:"+d.ID, msg)
+	}()
+	return nil
+}
+
 // closeShell is the internal helper used by lifecycle hooks (disconnect,
 // shutdown) to tear down a shell without surfacing an error.
 func (a *App) closeShell(id string) {
@@ -763,13 +1152,9 @@ func (a *App) closeShell(id string) {
 
 // RunContainerCommand runs `cmd` inside `containerID` via `docker exec sh -c`.
 func (a *App) RunContainerCommand(id, containerID, cmd string) (*CommandResult, error) {
-	conn, err := a.pool.Get(id)
-	if err != nil {
-		return nil, err
-	}
 	ctx, cancel := context.WithTimeout(a.ctx, 60*time.Second)
 	defer cancel()
-	res, err := docker.Exec(ctx, conn, containerID, cmd)
+	res, err := docker.Exec(ctx, a.execFn(id, false), containerID, cmd)
 	if err != nil {
 		return nil, err
 	}

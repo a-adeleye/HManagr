@@ -6,12 +6,32 @@ export function AddVPS(arg1) {
   return window['go']['main']['App']['AddVPS'](arg1);
 }
 
+export function ChmodRemoteFile(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['ChmodRemoteFile'](arg1, arg2, arg3, arg4);
+}
+
 export function ChooseOpenPath() {
   return window['go']['main']['App']['ChooseOpenPath']();
 }
 
 export function ChooseSavePath(arg1, arg2) {
   return window['go']['main']['App']['ChooseSavePath'](arg1, arg2);
+}
+
+export function ChownRemoteFile(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['ChownRemoteFile'](arg1, arg2, arg3, arg4, arg5);
+}
+
+export function ClearSudoPassword(arg1) {
+  return window['go']['main']['App']['ClearSudoPassword'](arg1);
+}
+
+export function ClipboardText() {
+  return window['go']['main']['App']['ClipboardText']();
+}
+
+export function CloseShell(arg1) {
+  return window['go']['main']['App']['CloseShell'](arg1);
 }
 
 export function Connect(arg1) {
@@ -22,20 +42,52 @@ export function ContainerLogs(arg1, arg2, arg3) {
   return window['go']['main']['App']['ContainerLogs'](arg1, arg2, arg3);
 }
 
+export function DBDeleteRow(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
+  return window['go']['main']['App']['DBDeleteRow'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
+}
+
+export function DBInsertRow(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
+  return window['go']['main']['App']['DBInsertRow'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
+}
+
+export function DBListDatabases(arg1, arg2, arg3) {
+  return window['go']['main']['App']['DBListDatabases'](arg1, arg2, arg3);
+}
+
+export function DBListTables(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['DBListTables'](arg1, arg2, arg3, arg4);
+}
+
+export function DBQuery(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['DBQuery'](arg1, arg2, arg3, arg4, arg5);
+}
+
+export function DBTableColumns(arg1, arg2, arg3, arg4, arg5, arg6) {
+  return window['go']['main']['App']['DBTableColumns'](arg1, arg2, arg3, arg4, arg5, arg6);
+}
+
+export function DBTableRows(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
+  return window['go']['main']['App']['DBTableRows'](arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
+}
+
+export function DBUpdateRow(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
+  return window['go']['main']['App']['DBUpdateRow'](arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
+}
+
 export function DefaultDownloadDir() {
   return window['go']['main']['App']['DefaultDownloadDir']();
 }
 
+export function DeleteDeployment(arg1) {
+  return window['go']['main']['App']['DeleteDeployment'](arg1);
+}
+
+export function DeleteProject(arg1) {
+  return window['go']['main']['App']['DeleteProject'](arg1);
+}
+
 export function DeleteRemoteFile(arg1, arg2) {
   return window['go']['main']['App']['DeleteRemoteFile'](arg1, arg2);
-}
-
-export function ReadRemoteFile(arg1, arg2) {
-  return window['go']['main']['App']['ReadRemoteFile'](arg1, arg2);
-}
-
-export function WriteRemoteFile(arg1, arg2, arg3) {
-  return window['go']['main']['App']['WriteRemoteFile'](arg1, arg2, arg3);
 }
 
 export function DeleteVPS(arg1) {
@@ -50,20 +102,68 @@ export function DownloadFile(arg1, arg2, arg3) {
   return window['go']['main']['App']['DownloadFile'](arg1, arg2, arg3);
 }
 
+export function FindComposeFile(arg1, arg2) {
+  return window['go']['main']['App']['FindComposeFile'](arg1, arg2);
+}
+
+export function HasSudoPassword(arg1) {
+  return window['go']['main']['App']['HasSudoPassword'](arg1);
+}
+
+export function InspectMigration(arg1, arg2, arg3) {
+  return window['go']['main']['App']['InspectMigration'](arg1, arg2, arg3);
+}
+
 export function IsConnected(arg1) {
   return window['go']['main']['App']['IsConnected'](arg1);
 }
 
-export function ListContainers(arg1) {
-  return window['go']['main']['App']['ListContainers'](arg1);
+export function ListContainers(arg1, arg2) {
+  return window['go']['main']['App']['ListContainers'](arg1, arg2);
+}
+
+export function ListDBContainers(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ListDBContainers'](arg1, arg2, arg3);
+}
+
+export function ListDeployments() {
+  return window['go']['main']['App']['ListDeployments']();
 }
 
 export function ListFiles(arg1, arg2) {
   return window['go']['main']['App']['ListFiles'](arg1, arg2);
 }
 
+export function ListProjects() {
+  return window['go']['main']['App']['ListProjects']();
+}
+
 export function ListVPS() {
   return window['go']['main']['App']['ListVPS']();
+}
+
+export function LocalAvailable() {
+  return window['go']['main']['App']['LocalAvailable']();
+}
+
+export function LocalStartDir() {
+  return window['go']['main']['App']['LocalStartDir']();
+}
+
+export function LocalUnavailableReason() {
+  return window['go']['main']['App']['LocalUnavailableReason']();
+}
+
+export function MakeDir(arg1, arg2, arg3) {
+  return window['go']['main']['App']['MakeDir'](arg1, arg2, arg3);
+}
+
+export function ReadRemoteFile(arg1, arg2) {
+  return window['go']['main']['App']['ReadRemoteFile'](arg1, arg2);
+}
+
+export function ResizeShell(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ResizeShell'](arg1, arg2, arg3);
 }
 
 export function RestartContainer(arg1, arg2) {
@@ -78,8 +178,40 @@ export function RunContainerCommand(arg1, arg2, arg3) {
   return window['go']['main']['App']['RunContainerCommand'](arg1, arg2, arg3);
 }
 
+export function RunDeploy(arg1) {
+  return window['go']['main']['App']['RunDeploy'](arg1);
+}
+
+export function RunMigration(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['RunMigration'](arg1, arg2, arg3, arg4);
+}
+
+export function SaveDeployment(arg1) {
+  return window['go']['main']['App']['SaveDeployment'](arg1);
+}
+
+export function SaveProject(arg1, arg2) {
+  return window['go']['main']['App']['SaveProject'](arg1, arg2);
+}
+
+export function SetClipboardText(arg1) {
+  return window['go']['main']['App']['SetClipboardText'](arg1);
+}
+
+export function SetSudoPassword(arg1, arg2) {
+  return window['go']['main']['App']['SetSudoPassword'](arg1, arg2);
+}
+
 export function StartContainer(arg1, arg2) {
   return window['go']['main']['App']['StartContainer'](arg1, arg2);
+}
+
+export function StartShell(arg1, arg2, arg3) {
+  return window['go']['main']['App']['StartShell'](arg1, arg2, arg3);
+}
+
+export function StatRemoteFile(arg1, arg2) {
+  return window['go']['main']['App']['StatRemoteFile'](arg1, arg2);
 }
 
 export function StopContainer(arg1, arg2) {
@@ -94,70 +226,10 @@ export function UploadFile(arg1, arg2, arg3) {
   return window['go']['main']['App']['UploadFile'](arg1, arg2, arg3);
 }
 
-export function StartShell(arg1, arg2, arg3) {
-  return window['go']['main']['App']['StartShell'](arg1, arg2, arg3);
+export function WriteRemoteFile(arg1, arg2, arg3) {
+  return window['go']['main']['App']['WriteRemoteFile'](arg1, arg2, arg3);
 }
 
 export function WriteShell(arg1, arg2) {
   return window['go']['main']['App']['WriteShell'](arg1, arg2);
-}
-
-export function ResizeShell(arg1, arg2, arg3) {
-  return window['go']['main']['App']['ResizeShell'](arg1, arg2, arg3);
-}
-
-export function CloseShell(arg1) {
-  return window['go']['main']['App']['CloseShell'](arg1);
-}
-
-export function MakeDir(arg1, arg2, arg3) {
-  return window['go']['main']['App']['MakeDir'](arg1, arg2, arg3);
-}
-
-export function StatRemoteFile(arg1, arg2) {
-  return window['go']['main']['App']['StatRemoteFile'](arg1, arg2);
-}
-
-export function ChmodRemoteFile(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['ChmodRemoteFile'](arg1, arg2, arg3, arg4);
-}
-
-export function ChownRemoteFile(arg1, arg2, arg3, arg4, arg5) {
-  return window['go']['main']['App']['ChownRemoteFile'](arg1, arg2, arg3, arg4, arg5);
-}
-
-export function SetSudoPassword(arg1, arg2) {
-  return window['go']['main']['App']['SetSudoPassword'](arg1, arg2);
-}
-
-export function HasSudoPassword(arg1) {
-  return window['go']['main']['App']['HasSudoPassword'](arg1);
-}
-
-export function ClearSudoPassword(arg1) {
-  return window['go']['main']['App']['ClearSudoPassword'](arg1);
-}
-
-export function ProbeSudo(arg1) {
-  return window['go']['main']['App']['ProbeSudo'](arg1);
-}
-
-export function FindComposeFile(arg1, arg2) {
-  return window['go']['main']['App']['FindComposeFile'](arg1, arg2);
-}
-
-export function InspectMigration(arg1, arg2, arg3) {
-  return window['go']['main']['App']['InspectMigration'](arg1, arg2, arg3);
-}
-
-export function RunMigration(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['RunMigration'](arg1, arg2, arg3, arg4);
-}
-
-export function ClipboardText() {
-  return window['go']['main']['App']['ClipboardText']();
-}
-
-export function SetClipboardText(arg1) {
-  return window['go']['main']['App']['SetClipboardText'](arg1);
 }

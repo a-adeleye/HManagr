@@ -18,13 +18,22 @@ type Inventory struct {
 	Volumes     []Volume  `json:"volumes"`
 	BindMounts  []string  `json:"bindMounts"` // shown as warnings; not migrated in v1
 	EnvFiles    []string  `json:"envFiles"`   // paths relative to compose dir
-	Warnings    []string  `json:"warnings"`
+	// ExternalNetworks are docker networks the compose file declares as external.
+	// Compose won't create these on `up` — they must already exist — so the
+	// migration recreates them on the target by name before starting the stack.
+	ExternalNetworks []string `json:"externalNetworks"`
+	// BuildImages are the resolved image tags of services that build from source.
+	// The migration ships these prebuilt (docker save/load) so the target doesn't
+	// have to reproduce the build context or run a builder.
+	BuildImages []string `json:"buildImages"`
+	Warnings    []string `json:"warnings"`
 }
 
 type Service struct {
 	Name       string `json:"name"`
 	Image      string `json:"image"`
 	IsPostgres bool   `json:"isPostgres"`
+	Builds     bool   `json:"builds"` // has a build: section — its image is shipped prebuilt
 }
 
 type Volume struct {

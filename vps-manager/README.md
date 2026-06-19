@@ -6,10 +6,29 @@ Built with [Wails v2](https://wails.io) (Go backend + web UI). Binary is ~15 MB.
 
 ## Features
 
+- **Local environment** — a built-in "Local (this machine)" entry (always pinned at
+  the top of the sidebar) manages the Docker daemon on your own computer with no SSH.
+  Docker, the database manager, GitHub deploys, and a native file browser all work
+  locally; the interactive terminal and migration are SSH-only. On Windows this needs
+  a POSIX shell (Git for Windows bundles one) since commands run through bash/sh.
 - Add/edit/delete VPS configs (host, port, user, key or password auth)
 - Connect via SSH with key or password
 - Browse remote filesystem; download, upload, and delete files via native file dialogs
 - View Docker containers; start/stop/restart; view logs
+- **Database manager** — browse Postgres/MySQL/MariaDB databases running in Docker
+  containers: list databases & tables, page through rows, insert/edit/delete rows
+  (primary-key aware), and run arbitrary SQL with a results grid. No DB port needs
+  to be exposed — everything goes through `docker exec` + the engine's own CLI, and
+  credentials are sniffed from the container environment (never leave the backend).
+- **Deploy from GitHub** — Coolify-style: point a deployment at a repo + VPS + path,
+  define env vars / secrets, and it clones (or fetches + resets), writes a `.env`,
+  and runs `docker compose up -d --build` with a live streamed log. Private repos
+  authenticate with a GitHub token that's injected only for the clone and never
+  persisted on the VPS.
+- **Migration** — move a docker-compose stack (compose file, env files, named
+  volumes) from one VPS to another. The "use sudo" checkbox assumes passwordless
+  sudo (or a root login) — no password prompting; permission failures surface as-is.
+- Interactive PTY terminal (xterm.js) with copy/paste
 - Run arbitrary shell commands with output history (`↑` / `↓` to navigate)
 - Per-VPS persistent connections (no lag from reconnecting on every action)
 
@@ -53,10 +72,13 @@ Output lands in `build/bin/vps-manager` (or `.exe` on Windows). It's a single ex
 ├── app.go                   # Methods exposed to the frontend
 ├── wails.json               # Wails config
 ├── internal/
-│   ├── config/              # VPS config persistence (JSON in user config dir)
-│   ├── ssh/                 # SSH connection pool, command execution
+│   ├── config/              # VPS + deployment persistence (JSON in user config dir)
+│   ├── ssh/                 # SSH connection pool, command execution, streaming
 │   ├── sftp/                # File ops (list, download, upload, delete)
-│   └── docker/              # Docker CLI helpers (over SSH)
+│   ├── docker/              # Docker CLI helpers (over SSH)
+│   ├── db/                  # Database manager (docker exec → psql/mysql)
+│   ├── deploy/              # GitHub repo → VPS via docker compose
+│   └── migration/           # Move a compose stack between VPSes
 └── frontend/
     ├── index.html
     ├── package.json
@@ -89,12 +111,12 @@ This is a starter project. Before pointing it at production, harden these:
 
 These are not implemented but would slot in cleanly:
 
-- **Interactive PTY terminal** via `xterm.js` + Wails events (the current terminal is one-shot exec; fine for `ls` and `systemctl restart`, no good for `vim` or `htop`)
-- **File preview / edit** for text files (download → edit in a modal → upload)
 - **Multi-select** file operations (bulk download / delete)
 - **System monitoring panel** (`top`, `df -h`, `free -h`, parsed and displayed)
-- **`docker compose`** support — list services, up/down individual ones
+- **Deploy webhooks** — trigger a deploy from a GitHub push event
+- **Postgres `pg_dump` migration mode** — logical dump/restore as an alternative to volume archiving (the `PostgresMode` field is already scaffolded in `migration.Plan`)
 - **Saved command snippets** per-VPS
+- **DB export** — dump a table or query result to CSV locally
 
 ## Why these choices?
 
