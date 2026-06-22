@@ -83,6 +83,17 @@ type Store struct {
 	data fileData
 }
 
+// KnownHostsPath is the app's SSH known_hosts file, kept next to config.json in
+// the user config dir. Best-effort: returns "" if the config dir can't be
+// located (which disables host-key persistence rather than crashing).
+func KnownHostsPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "vps-manager", "known_hosts")
+}
+
 func New() (*Store, error) {
 	dir, err := os.UserConfigDir()
 	if err != nil {

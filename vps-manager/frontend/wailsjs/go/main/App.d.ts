@@ -6,6 +6,9 @@ import {migration} from '../models';
 import {backup} from '../models';
 import {docker} from '../models';
 import {sftp} from '../models';
+import {maintenance} from '../models';
+import {provision} from '../models';
+import {caddy} from '../models';
 import {main} from '../models';
 
 export function AddVPS(arg1:config.VPS):Promise<void>;
@@ -24,7 +27,27 @@ export function ClipboardText():Promise<string>;
 
 export function CloseShell(arg1:string):Promise<void>;
 
-export function Connect(arg1:string):Promise<void>;
+export function Connect(arg1:string):Promise<main.ConnectStatus>;
+
+export function TrustHostKey(arg1:string):Promise<main.ConnectStatus>;
+
+export function ForgetHostKey(arg1:string):Promise<void>;
+
+export function SystemUsage(arg1:string,arg2:boolean):Promise<maintenance.Usage>;
+
+export function PruneDocker(arg1:string,arg2:maintenance.PruneOptions,arg3:boolean):Promise<void>;
+
+export function SystemLargestImages(arg1:string,arg2:number,arg3:boolean):Promise<Array<maintenance.Image>>;
+
+export function ProvisionDatabaseEngines():Promise<Array<provision.Engine>>;
+
+export function ProvisionDatabase(arg1:string,arg2:provision.Spec,arg3:boolean):Promise<provision.Result>;
+
+export function DetectCaddyProxy(arg1:string,arg2:boolean):Promise<caddy.ProxyInfo>;
+
+export function ExposeServiceDomain(arg1:string,arg2:caddy.ExposeSpec,arg3:boolean):Promise<void>;
+
+export function CloudflareUpsert(arg1:string,arg2:string,arg3:string,arg4:string,arg5:boolean):Promise<void>;
 
 export function ContainerLogs(arg1:string,arg2:string,arg3:number):Promise<string>;
 

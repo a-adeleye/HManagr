@@ -24,12 +24,19 @@ type Connection struct {
 // Pool keeps a map of live SSH connections keyed by VPS ID so we don't
 // re-dial for every action (a UI doing per-action connects would feel laggy).
 type Pool struct {
-	mu    sync.Mutex
-	conns map[string]*Connection
+	mu       sync.Mutex
+	conns    map[string]*Connection
+	hostKeys *HostKeyStore
 }
 
-func NewPool() *Pool {
-	return &Pool{conns: make(map[string]*Connection)}
+// NewPool returns a connection pool that verifies host keys against the
+// known_hosts file at knownHostsPath (trust-on-first-use). An empty path
+// disables persistence — see HostKeyStore.
+func NewPool(knownHostsPath string) *Pool {
+	return &Pool{
+		conns:    make(map[string]*Connection),
+		hostKeys: NewHostKeyStore(knownHostsPath),
+	}
 }
 
 type ConnectOptions struct {
@@ -40,6 +47,10 @@ type ConnectOptions struct {
 	AuthType string // "key" or "password"
 	KeyPath  string
 	Password string
+	// TrustNewHostKey, when true, appends an as-yet-unknown host key to
+	// known_hosts and accepts it instead of returning *UnknownHostKeyError. Set
+	// only after the user has reviewed the fingerprint and agreed to trust it.
+	TrustNewHostKey bool
 }
 
 // Connect dials the VPS and stores the live client. If we already have a
@@ -84,7 +95,7 @@ func (p *Pool) Connect(opts ConnectOptions) error {
 	cfg := &ssh.ClientConfig{
 		User:            opts.User,
 		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // TODO: known_hosts verification
+		HostKeyCallback: p.hostKeys.callback(opts.TrustNewHostKey),
 		Timeout:         10 * time.Second,
 	}
 
@@ -124,6 +135,16 @@ func (p *Pool) IsConnected(id string) bool {
 	defer p.mu.Unlock()
 	_, ok := p.conns[id]
 	return ok
+}
+
+// ForgetHostKey drops the stored host key for host:port so the next connection
+// re-trusts it. Used to recover from a ChangedHostKeyError after a legitimate
+// server rebuild.
+func (p *Pool) ForgetHostKey(host string, port int) error {
+	if port == 0 {
+		port = 22
+	}
+	return p.hostKeys.Remove(net.JoinHostPort(host, strconv.Itoa(port)))
 }
 
 // Close terminates all pooled connections (called on app shutdown).

@@ -38,6 +38,46 @@ export function Connect(arg1) {
   return window['go']['main']['App']['Connect'](arg1);
 }
 
+export function TrustHostKey(arg1) {
+  return window['go']['main']['App']['TrustHostKey'](arg1);
+}
+
+export function ForgetHostKey(arg1) {
+  return window['go']['main']['App']['ForgetHostKey'](arg1);
+}
+
+export function SystemUsage(arg1, arg2) {
+  return window['go']['main']['App']['SystemUsage'](arg1, arg2);
+}
+
+export function PruneDocker(arg1, arg2, arg3) {
+  return window['go']['main']['App']['PruneDocker'](arg1, arg2, arg3);
+}
+
+export function SystemLargestImages(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SystemLargestImages'](arg1, arg2, arg3);
+}
+
+export function ProvisionDatabaseEngines() {
+  return window['go']['main']['App']['ProvisionDatabaseEngines']();
+}
+
+export function ProvisionDatabase(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ProvisionDatabase'](arg1, arg2, arg3);
+}
+
+export function DetectCaddyProxy(arg1, arg2) {
+  return window['go']['main']['App']['DetectCaddyProxy'](arg1, arg2);
+}
+
+export function ExposeServiceDomain(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ExposeServiceDomain'](arg1, arg2, arg3);
+}
+
+export function CloudflareUpsert(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['CloudflareUpsert'](arg1, arg2, arg3, arg4, arg5);
+}
+
 export function ContainerLogs(arg1, arg2, arg3) {
   return window['go']['main']['App']['ContainerLogs'](arg1, arg2, arg3);
 }

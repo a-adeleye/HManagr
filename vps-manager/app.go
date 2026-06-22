@@ -15,12 +15,15 @@ import (
 	"time"
 
 	"vps-manager/internal/backup"
+	"vps-manager/internal/caddy"
 	"vps-manager/internal/config"
 	"vps-manager/internal/db"
 	"vps-manager/internal/deploy"
 	"vps-manager/internal/docker"
 	"vps-manager/internal/local"
+	"vps-manager/internal/maintenance"
 	"vps-manager/internal/migration"
+	"vps-manager/internal/provision"
 	"vps-manager/internal/sftp"
 	sshpkg "vps-manager/internal/ssh"
 
@@ -71,7 +74,7 @@ func localVPS() config.VPS {
 
 func NewApp() *App {
 	return &App{
-		pool:          sshpkg.NewPool(),
+		pool:          sshpkg.NewPool(config.KnownHostsPath()),
 		shells:        make(map[string]*sshpkg.Session),
 		sudoPasswords: make(map[string]string),
 		dbCache:       make(map[string]*db.Container),
@@ -203,35 +206,114 @@ func (a *App) DeleteProject(id string) error {
 
 // ───────── Connection lifecycle ─────────
 
-func (a *App) Connect(id string) error {
+// ConnectStatus is the result of a connection attempt. A successful connect sets
+// Connected. An unverified SSH host key is surfaced (not thrown) so the frontend
+// can show the fingerprint and prompt: NeedsTrust for a never-seen host,
+// KeyChanged for a host whose key no longer matches (a possible MITM).
+type ConnectStatus struct {
+	Connected   bool   `json:"connected"`
+	NeedsTrust  bool   `json:"needsTrust"`
+	KeyChanged  bool   `json:"keyChanged"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	KeyType     string `json:"keyType,omitempty"`
+	Host        string `json:"host,omitempty"`
+	Message     string `json:"message,omitempty"`
+}
+
+// Connect dials the VPS, verifying its SSH host key against known_hosts. An
+// unknown or changed key returns a ConnectStatus (no error) describing what the
+// user must confirm; call TrustHostKey to proceed once they've reviewed it.
+func (a *App) Connect(id string) (*ConnectStatus, error) {
+	return a.connect(id, false)
+}
+
+// TrustHostKey retries the connection, trusting (and persisting) a host key the
+// user has reviewed. For a changed key, call ForgetHostKey first.
+func (a *App) TrustHostKey(id string) (*ConnectStatus, error) {
+	return a.connect(id, true)
+}
+
+// ForgetHostKey drops the stored host key for a server so it can be re-trusted
+// (e.g. after a legitimate rebuild that triggered a KeyChanged status).
+func (a *App) ForgetHostKey(id string) error {
 	if isLocal(id) {
-		if a.local == nil {
-			if a.localErr != nil {
-				return a.localErr
-			}
-			return fmt.Errorf("local mode is unavailable on this machine")
-		}
-		ctx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
-		defer cancel()
-		if err := a.local.Preflight(ctx); err != nil {
-			return fmt.Errorf("docker not reachable locally: %w", err)
-		}
-		a.localReady.Store(true)
 		return nil
 	}
 	v, ok := a.store.Get(id)
 	if !ok {
 		return fmt.Errorf("vps %s not found", id)
 	}
-	return a.pool.Connect(sshpkg.ConnectOptions{
-		ID:       v.ID,
-		Host:     v.Host,
-		Port:     v.Port,
-		User:     v.User,
-		AuthType: v.AuthType,
-		KeyPath:  v.KeyPath,
-		Password: v.Password,
+	return a.pool.ForgetHostKey(v.Host, v.Port)
+}
+
+func (a *App) connect(id string, trustNew bool) (*ConnectStatus, error) {
+	if isLocal(id) {
+		if a.local == nil {
+			if a.localErr != nil {
+				return nil, a.localErr
+			}
+			return nil, fmt.Errorf("local mode is unavailable on this machine")
+		}
+		ctx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
+		defer cancel()
+		if err := a.local.Preflight(ctx); err != nil {
+			return nil, fmt.Errorf("docker not reachable locally: %w", err)
+		}
+		a.localReady.Store(true)
+		return &ConnectStatus{Connected: true}, nil
+	}
+	v, ok := a.store.Get(id)
+	if !ok {
+		return nil, fmt.Errorf("vps %s not found", id)
+	}
+	err := a.pool.Connect(sshpkg.ConnectOptions{
+		ID:              v.ID,
+		Host:            v.Host,
+		Port:            v.Port,
+		User:            v.User,
+		AuthType:        v.AuthType,
+		KeyPath:         v.KeyPath,
+		Password:        v.Password,
+		TrustNewHostKey: trustNew,
 	})
+	if err != nil {
+		var unknown *sshpkg.UnknownHostKeyError
+		var changed *sshpkg.ChangedHostKeyError
+		switch {
+		case errors.As(err, &unknown):
+			return &ConnectStatus{
+				NeedsTrust:  true,
+				Fingerprint: unknown.Fingerprint,
+				KeyType:     unknown.KeyType,
+				Host:        unknown.Host,
+				Message:     "This server's SSH host key isn't trusted yet.",
+			}, nil
+		case errors.As(err, &changed):
+			return &ConnectStatus{
+				KeyChanged:  true,
+				Fingerprint: changed.Fingerprint,
+				KeyType:     changed.KeyType,
+				Host:        changed.Host,
+				Message:     "This server's SSH host key has CHANGED — possible man-in-the-middle.",
+			}, nil
+		}
+		return nil, err
+	}
+	return &ConnectStatus{Connected: true}, nil
+}
+
+// connectErr connects without trusting new host keys and collapses the
+// needs-trust / key-changed statuses into errors, for internal callers (deploy,
+// cleanup, backup) that can't prompt the user interactively.
+func (a *App) connectErr(id string) error {
+	st, err := a.connect(id, false)
+	if err != nil {
+		return err
+	}
+	if st != nil && !st.Connected {
+		return errors.New(st.Message + " Connect to this server from the sidebar first to review and trust its key.")
+	}
+	return nil
 }
 
 func (a *App) Disconnect(id string) error {
@@ -1180,7 +1262,7 @@ func (a *App) RunDeploy(deployID string) error {
 		return fmt.Errorf("deployment %s not found", deployID)
 	}
 	if isLocal(d.VPSID) {
-		if err := a.Connect(LocalID); err != nil {
+		if err := a.connectErr(LocalID); err != nil {
 			return err
 		}
 	} else {
@@ -1188,7 +1270,7 @@ func (a *App) RunDeploy(deployID string) error {
 			return fmt.Errorf("the VPS for this deployment no longer exists")
 		}
 		if !a.pool.IsConnected(d.VPSID) {
-			if err := a.Connect(d.VPSID); err != nil {
+			if err := a.connectErr(d.VPSID); err != nil {
 				return fmt.Errorf("connect: %w", err)
 			}
 		}
@@ -1264,13 +1346,13 @@ func (a *App) RunContainerCommand(id, containerID, cmd string) (*CommandResult, 
 // backup actions work straight after selecting a server.
 func (a *App) ensureConnected(id string) error {
 	if isLocal(id) {
-		return a.Connect(LocalID)
+		return a.connectErr(LocalID)
 	}
 	if _, ok := a.store.Get(id); !ok {
 		return fmt.Errorf("vps %s not found", id)
 	}
 	if !a.pool.IsConnected(id) {
-		return a.Connect(id)
+		return a.connectErr(id)
 	}
 	return nil
 }
@@ -1561,4 +1643,93 @@ func (a *App) RestoreBackup(targetVpsID string, job backup.Job, secrets backup.S
 		wailsruntime.EventsEmit(a.ctx, "restore:done", msg)
 	}()
 	return nil
+}
+
+// ───────── System maintenance (disk / docker usage / prune) ─────────
+
+// SystemUsage gathers root-fs + Docker disk usage for the maintenance panel.
+func (a *App) SystemUsage(id string, useSudo bool) (*maintenance.Usage, error) {
+	if err := a.ensureConnected(id); err != nil {
+		return nil, err
+	}
+	return maintenance.GetUsage(a.ctx, maintenance.ExecFn(a.execFn(id, useSudo)))
+}
+
+// PruneDocker streams `docker system prune` (with the opt-in destructive flags
+// in opts) to the "maintenance-prune" Wails event. -a / --volumes are only
+// passed when the caller explicitly sets them in opts.
+func (a *App) PruneDocker(id string, opts maintenance.PruneOptions, useSudo bool) error {
+	if err := a.ensureConnected(id); err != nil {
+		return err
+	}
+	stream := maintenance.StreamFn(a.streamFn(id, useSudo))
+	exit, err := maintenance.Prune(a.ctx, stream, opts, func(chunk string) {
+		wailsruntime.EventsEmit(a.ctx, "maintenance-prune", strings.TrimRight(chunk, "\n"))
+	})
+	if err != nil {
+		return err
+	}
+	if exit != 0 {
+		return fmt.Errorf("docker system prune exited with code %d", exit)
+	}
+	return nil
+}
+
+// SystemLargestImages lists the biggest Docker images (cheap "what's using space").
+func (a *App) SystemLargestImages(id string, limit int, useSudo bool) ([]maintenance.Image, error) {
+	if err := a.ensureConnected(id); err != nil {
+		return nil, err
+	}
+	return maintenance.ListLargestImages(a.ctx, maintenance.ExecFn(a.execFn(id, useSudo)), limit)
+}
+
+// ───────── Database provisioning ─────────
+
+// ProvisionDatabaseEngines returns the static engine catalog for the form.
+func (a *App) ProvisionDatabaseEngines() []provision.Engine {
+	return provision.Engines()
+}
+
+// ProvisionDatabase stands up a managed database on the given host as a
+// docker-compose stack, streaming progress to the "provision-db" Wails event.
+// The returned Result carries the generated password — show it to the user ONCE.
+func (a *App) ProvisionDatabase(id string, spec provision.Spec, useSudo bool) (*provision.Result, error) {
+	if err := a.ensureConnected(id); err != nil {
+		return nil, err
+	}
+	exec := provision.ExecFn(a.execFn(id, useSudo))
+	stream := provision.StreamFn(a.streamFn(id, useSudo))
+	secretWrite := provision.SecretWriteFn(a.secretWrite(id, useSudo))
+	return provision.Provision(a.ctx, exec, stream, secretWrite, spec, func(line string) {
+		wailsruntime.EventsEmit(a.ctx, "provision-db", line)
+	})
+}
+
+// ───────── Domains (Caddy label proxy + Cloudflare DNS) ─────────
+
+// DetectCaddyProxy reports whether a caddy-docker-proxy is running on the host.
+func (a *App) DetectCaddyProxy(id string, useSudo bool) (*caddy.ProxyInfo, error) {
+	if err := a.ensureConnected(id); err != nil {
+		return nil, err
+	}
+	return caddy.DetectProxy(a.ctx, caddy.ExecFn(a.execFn(id, useSudo)))
+}
+
+// ExposeServiceDomain writes a caddy-docker-proxy label override next to the
+// stack and re-ups it, streaming progress to the "caddy-expose" Wails event.
+func (a *App) ExposeServiceDomain(id string, spec caddy.ExposeSpec, useSudo bool) error {
+	if err := a.ensureConnected(id); err != nil {
+		return err
+	}
+	exec := caddy.ExecFn(a.execFn(id, useSudo))
+	stream := caddy.StreamFn(a.streamFn(id, useSudo))
+	return caddy.ApplyOverride(a.ctx, exec, stream, spec, func(line string) {
+		wailsruntime.EventsEmit(a.ctx, "caddy-expose", line)
+	})
+}
+
+// CloudflareUpsert creates/updates an A record from the DESKTOP. The token is
+// never sent to the VPS. proxied toggles Cloudflare's orange-cloud proxying.
+func (a *App) CloudflareUpsert(apiToken, zone, name, ipv4 string, proxied bool) error {
+	return caddy.CloudflareUpsertA(a.ctx, apiToken, zone, name, ipv4, proxied)
 }

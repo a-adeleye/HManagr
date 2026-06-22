@@ -296,6 +296,7 @@ input, button, select { font-family: inherit; user-select: text; }
 /* Tabs */
 .tabs {
   display: flex;
+  flex-wrap: wrap;
   border-bottom: 1px solid var(--border);
   padding: 0 20px;
   gap: 2px;
@@ -1083,3 +1084,53 @@ input, button, select { font-family: inherit; user-select: text; }
   border: 2px solid var(--bg);
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
+
+/* ───────── Domains / Provision / Maintenance panels ───────── */
+.ok-msg {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--success);
+}
+.info-card {
+  margin: 6px 0;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  font-size: 13px;
+}
+.info-card.ok { border-color: rgba(61, 220, 151, 0.4); background: rgba(61, 220, 151, 0.08); }
+.info-card.warn-card { border-color: rgba(244, 185, 66, 0.4); background: rgba(244, 185, 66, 0.08); }
+.info-card .card-title { font-weight: 600; margin-bottom: 8px; }
+.card-title { font-weight: 600; font-size: 13px; margin-bottom: 8px; }
+
+.usage-bar {
+  height: 10px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+.usage-fill { height: 100%; background: var(--success); border-radius: 999px; transition: width .3s; }
+.usage-fill.warn-bar { background: var(--warning); }
+.usage-fill.danger { background: var(--danger); }
+
+.mini-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.mini-table th { text-align: left; color: var(--text-muted); font-weight: 500; padding: 2px 8px 2px 0; }
+.mini-table td { padding: 3px 8px 3px 0; border-top: 1px solid var(--border); }
+.mini-table td:first-child { text-transform: capitalize; }
+
+.img-row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; font-size: 12px; border-top: 1px solid var(--border); }
+.img-row:first-child { border-top: 0; }
+
+.result-card {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid rgba(61, 220, 151, 0.4);
+  background: rgba(61, 220, 151, 0.08);
+  border-radius: var(--radius-sm);
+}
+.result-card .kv { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; font-size: 13px; }
+.result-card .kv span { color: var(--text-muted); }
+.result-card .kv code { user-select: all; }
+
+.warn { color: var(--warning); }

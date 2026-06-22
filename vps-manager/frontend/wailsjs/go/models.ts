@@ -419,7 +419,31 @@ export namespace docker {
 }
 
 export namespace main {
-	
+
+	export class ConnectStatus {
+	    connected: boolean;
+	    needsTrust: boolean;
+	    keyChanged: boolean;
+	    fingerprint?: string;
+	    keyType?: string;
+	    host?: string;
+	    message?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new ConnectStatus(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.connected = source["connected"];
+	        this.needsTrust = source["needsTrust"];
+	        this.keyChanged = source["keyChanged"];
+	        this.fingerprint = source["fingerprint"];
+	        this.keyType = source["keyType"];
+	        this.host = source["host"];
+	        this.message = source["message"];
+	    }
+	}
 	export class CommandResult {
 	    stdout: string;
 	    stderr: string;
@@ -623,6 +647,250 @@ export namespace sftp {
 	        this.mode = source["mode"];
 	        this.isDir = source["isDir"];
 	        this.modTime = source["modTime"];
+	    }
+	}
+
+}
+
+export namespace maintenance {
+
+	export class DiskUsage {
+	    filesystem: string;
+	    totalBytes: number;
+	    usedBytes: number;
+	    availBytes: number;
+	    usePercent: number;
+	    mountPoint: string;
+	    totalHuman: string;
+	    usedHuman: string;
+	    availHuman: string;
+	    available: boolean;
+
+	    static createFrom(source: any = {}) { return new DiskUsage(source); }
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.filesystem = source["filesystem"];
+	        this.totalBytes = source["totalBytes"];
+	        this.usedBytes = source["usedBytes"];
+	        this.availBytes = source["availBytes"];
+	        this.usePercent = source["usePercent"];
+	        this.mountPoint = source["mountPoint"];
+	        this.totalHuman = source["totalHuman"];
+	        this.usedHuman = source["usedHuman"];
+	        this.availHuman = source["availHuman"];
+	        this.available = source["available"];
+	    }
+	}
+	export class DockerCategory {
+	    type: string;
+	    totalCount: number;
+	    activeCount: number;
+	    sizeBytes: number;
+	    reclaimableBytes: number;
+	    sizeHuman: string;
+	    reclaimableHuman: string;
+
+	    static createFrom(source: any = {}) { return new DockerCategory(source); }
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.type = source["type"];
+	        this.totalCount = source["totalCount"];
+	        this.activeCount = source["activeCount"];
+	        this.sizeBytes = source["sizeBytes"];
+	        this.reclaimableBytes = source["reclaimableBytes"];
+	        this.sizeHuman = source["sizeHuman"];
+	        this.reclaimableHuman = source["reclaimableHuman"];
+	    }
+	}
+	export class DockerUsage {
+	    images: DockerCategory;
+	    containers: DockerCategory;
+	    volumes: DockerCategory;
+	    buildCache: DockerCategory;
+	    totalBytes: number;
+	    reclaimableBytes: number;
+	    totalHuman: string;
+	    reclaimableHuman: string;
+	    available: boolean;
+
+	    static createFrom(source: any = {}) { return new DockerUsage(source); }
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.images = source["images"];
+	        this.containers = source["containers"];
+	        this.volumes = source["volumes"];
+	        this.buildCache = source["buildCache"];
+	        this.totalBytes = source["totalBytes"];
+	        this.reclaimableBytes = source["reclaimableBytes"];
+	        this.totalHuman = source["totalHuman"];
+	        this.reclaimableHuman = source["reclaimableHuman"];
+	        this.available = source["available"];
+	    }
+	}
+	export class Usage {
+	    disk: DiskUsage;
+	    docker: DockerUsage;
+
+	    static createFrom(source: any = {}) { return new Usage(source); }
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.disk = source["disk"];
+	        this.docker = source["docker"];
+	    }
+	}
+	export class PruneOptions {
+	    allImages: boolean;
+	    volumes: boolean;
+
+	    static createFrom(source: any = {}) { return new PruneOptions(source); }
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.allImages = source["allImages"];
+	        this.volumes = source["volumes"];
+	    }
+	}
+	export class Image {
+	    repository: string;
+	    tag: string;
+	    id: string;
+	    sizeBytes: number;
+	    sizeHuman: string;
+
+	    static createFrom(source: any = {}) { return new Image(source); }
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.repository = source["repository"];
+	        this.tag = source["tag"];
+	        this.id = source["id"];
+	        this.sizeBytes = source["sizeBytes"];
+	        this.sizeHuman = source["sizeHuman"];
+	    }
+	}
+
+}
+
+export namespace provision {
+
+	export class Engine {
+	    kind: string;
+	    label: string;
+	    image: string;
+	    tags: string[];
+	    defaultPort: number;
+	    mountPath: string;
+	    needsUser: boolean;
+	    needsDB: boolean;
+	    needsAuth: boolean;
+	    userEnvKey: string;
+	    passEnvKey: string;
+	    dbEnvKey: string;
+	    defaultUser: string;
+	    backupEngine: string;
+
+	    static createFrom(source: any = {}) { return new Engine(source); }
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.kind = source["kind"];
+	        this.label = source["label"];
+	        this.image = source["image"];
+	        this.tags = source["tags"];
+	        this.defaultPort = source["defaultPort"];
+	        this.mountPath = source["mountPath"];
+	        this.needsUser = source["needsUser"];
+	        this.needsDB = source["needsDB"];
+	        this.needsAuth = source["needsAuth"];
+	        this.userEnvKey = source["userEnvKey"];
+	        this.passEnvKey = source["passEnvKey"];
+	        this.dbEnvKey = source["dbEnvKey"];
+	        this.defaultUser = source["defaultUser"];
+	        this.backupEngine = source["backupEngine"];
+	    }
+	}
+	export class Spec {
+	    engine: string;
+	    dir: string;
+	    name: string;
+	    tag: string;
+	    user: string;
+	    database: string;
+	    password: string;
+	    exposePort: number;
+	    volumeName: string;
+
+	    static createFrom(source: any = {}) { return new Spec(source); }
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.engine = source["engine"];
+	        this.dir = source["dir"];
+	        this.name = source["name"];
+	        this.tag = source["tag"];
+	        this.user = source["user"];
+	        this.database = source["database"];
+	        this.password = source["password"];
+	        this.exposePort = source["exposePort"];
+	        this.volumeName = source["volumeName"];
+	    }
+	}
+	export class Result {
+	    containerName: string;
+	    service: string;
+	    volumeName: string;
+	    image: string;
+	    password: string;
+	    composeFile: string;
+	    backupEngine: string;
+
+	    static createFrom(source: any = {}) { return new Result(source); }
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.containerName = source["containerName"];
+	        this.service = source["service"];
+	        this.volumeName = source["volumeName"];
+	        this.image = source["image"];
+	        this.password = source["password"];
+	        this.composeFile = source["composeFile"];
+	        this.backupEngine = source["backupEngine"];
+	    }
+	}
+
+}
+
+export namespace caddy {
+
+	export class ProxyInfo {
+	    present: boolean;
+	    container: string;
+	    image: string;
+	    network: string;
+
+	    static createFrom(source: any = {}) { return new ProxyInfo(source); }
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.present = source["present"];
+	        this.container = source["container"];
+	        this.image = source["image"];
+	        this.network = source["network"];
+	    }
+	}
+	export class ExposeSpec {
+	    stackPath: string;
+	    mainCompose: string;
+	    service: string;
+	    domains: string[];
+	    port: number;
+	    network: string;
+	    overrideName: string;
+
+	    static createFrom(source: any = {}) { return new ExposeSpec(source); }
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.stackPath = source["stackPath"];
+	        this.mainCompose = source["mainCompose"];
+	        this.service = source["service"];
+	        this.domains = source["domains"];
+	        this.port = source["port"];
+	        this.network = source["network"];
+	        this.overrideName = source["overrideName"];
 	    }
 	}
 

@@ -13,13 +13,61 @@ package deploy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
+	"time"
 
 	"vps-manager/internal/config"
 	sshpkg "vps-manager/internal/ssh"
 )
+
+// envRefRe matches a ${NAME} reference to another variable in the same set.
+// Only the braced form is expanded so values that legitimately contain a bare
+// '$' (bcrypt hashes like $2a$…, regexes) are never touched.
+var envRefRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// resolveEnvVars expands ${KEY} references in env values against the other
+// variables in the same deployment, so users can compose values like
+// DATABASE_URL=postgres://app:${DB_PASSWORD}@db/app without repeating a secret.
+// docker compose does this for the compose file but NOT for env_file values,
+// which is the gap this fills. Resolution iterates (a value may reference one
+// that itself references another) with a fixed cap to break cycles; a reference
+// to an undefined key is left verbatim so downstream tools can still use it.
+func resolveEnvVars(vars []config.EnvVar) []config.EnvVar {
+	values := make(map[string]string, len(vars))
+	for _, v := range vars {
+		values[v.Key] = v.Value
+	}
+	expand := func(s string) string {
+		return envRefRe.ReplaceAllStringFunc(s, func(m string) string {
+			key := m[2 : len(m)-1] // strip ${ and }
+			if val, ok := values[key]; ok {
+				return val
+			}
+			return m
+		})
+	}
+	out := make([]config.EnvVar, len(vars))
+	copy(out, vars)
+	for pass := 0; pass < 10; pass++ {
+		changed := false
+		for i := range out {
+			expanded := expand(out[i].Value)
+			if expanded != out[i].Value {
+				out[i].Value = expanded
+				values[out[i].Key] = expanded
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return out
+}
 
 // ExecFn runs a buffered remote command (possibly sudo-wrapped by the caller).
 type ExecFn func(ctx context.Context, cmd string) (*sshpkg.ExecResult, error)
@@ -132,8 +180,9 @@ func Run(ctx context.Context, exec ExecFn, stream StreamFn, opts Options, log fu
 	// and apps commonly env_file it).
 	if len(opts.EnvVars) > 0 {
 		slog(fmt.Sprintf("→ Writing .env (%d variable(s))…", len(opts.EnvVars)))
+		resolved := resolveEnvVars(opts.EnvVars)
 		var b strings.Builder
-		for _, ev := range opts.EnvVars {
+		for _, ev := range resolved {
 			if strings.TrimSpace(ev.Key) == "" {
 				continue
 			}
@@ -187,14 +236,167 @@ func Run(ctx context.Context, exec ExecFn, stream StreamFn, opts Options, log fu
 		return commit, fmt.Errorf("docker compose up exited with code %d — see log above", exit)
 	}
 
-	// 7. Show resulting service state.
-	if res, err := exec(ctx, fmt.Sprintf("cd %s && docker compose -f %s ps", dir, shellQuote(composeFile))); err == nil && res.ExitCode == 0 {
-		slog("→ Stack status:")
-		slog(strings.TrimRight(res.Stdout, "\n"))
+	// 7. Health-gate. `up -d` returns as soon as containers START, so a service
+	// that crashes on boot or fails its healthcheck still looks like a success.
+	// Probe the stack and fail the deploy (with logs) if anything is broken.
+	if err := probeStack(ctx, exec, dir, composeFile, slog); err != nil {
+		return commit, err
 	}
 
 	slog("✓ Deploy complete.")
 	return commit, nil
+}
+
+// composePS is the subset of `docker compose ps --format json` we read.
+type composePS struct {
+	Name     string `json:"Name"`
+	Service  string `json:"Service"`
+	State    string `json:"State"`
+	Health   string `json:"Health"`
+	ExitCode int    `json:"ExitCode"`
+}
+
+// probeStack waits for the just-started services to settle, then reports their
+// health. It fails the deploy only when a service is DEFINITIVELY broken (exited
+// non-zero, restarting, dead, or unhealthy); a service still running its
+// healthcheck is reported as a warning, not a failure. A probe that can't run at
+// all (old compose, unparseable output) degrades to a plain status dump and
+// never blocks the deploy on its own shortcomings.
+func probeStack(ctx context.Context, exec ExecFn, dir, composeFile string, slog func(string)) error {
+	slog("→ Checking service health…")
+	psCmd := fmt.Sprintf("cd %s && docker compose -f %s ps --format json", dir, shellQuote(composeFile))
+
+	var services []composePS
+	var parsed bool
+	// Poll up to ~24s so containers with healthchecks have time to pass.
+	for attempt := 0; attempt < 12; attempt++ {
+		res, err := exec(ctx, psCmd)
+		if err != nil {
+			return err // transport / context cancellation
+		}
+		if res.ExitCode != 0 {
+			break // `ps --format json` unsupported → degrade below
+		}
+		svc, ok := parseComposePS(res.Stdout)
+		if !ok {
+			break
+		}
+		parsed = true
+		services = svc
+		if !anyPending(services) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	if !parsed {
+		// Couldn't introspect health — show a plain status and don't block.
+		if res, err := exec(ctx, fmt.Sprintf("cd %s && docker compose -f %s ps", dir, shellQuote(composeFile))); err == nil && res.ExitCode == 0 {
+			slog("→ Stack status:")
+			slog(strings.TrimRight(res.Stdout, "\n"))
+		}
+		return nil
+	}
+
+	var broken []composePS
+	for _, s := range services {
+		state := strings.ToLower(s.State)
+		health := strings.ToLower(s.Health)
+		switch {
+		case health == "unhealthy", state == "restarting", state == "dead",
+			state == "exited" && s.ExitCode != 0:
+			broken = append(broken, s)
+			slog(fmt.Sprintf("  ✗ %s — %s", svcLabel(s), describe(s)))
+		case health == "starting", state == "created":
+			slog(fmt.Sprintf("  … %s — %s (still starting)", svcLabel(s), describe(s)))
+		default:
+			slog(fmt.Sprintf("  ✓ %s — %s", svcLabel(s), describe(s)))
+		}
+	}
+
+	if len(broken) > 0 {
+		names := make([]string, len(broken))
+		for i, s := range broken {
+			names[i] = svcLabel(s)
+			slog(fmt.Sprintf("→ Recent logs for %s:", svcLabel(s)))
+			logsCmd := fmt.Sprintf("cd %s && docker compose -f %s logs --no-color --tail=40 %s",
+				dir, shellQuote(composeFile), shellQuote(s.Service))
+			if res, err := exec(ctx, logsCmd); err == nil {
+				slog(strings.TrimRight(res.Stdout, "\n"))
+			}
+		}
+		return fmt.Errorf("deploy started but %d service(s) failed to come up healthy: %s",
+			len(broken), strings.Join(names, ", "))
+	}
+
+	slog(fmt.Sprintf("✓ %d service(s) healthy.", len(services)))
+	return nil
+}
+
+func svcLabel(s composePS) string {
+	if s.Service != "" {
+		return s.Service
+	}
+	return s.Name
+}
+
+func describe(s composePS) string {
+	d := s.State
+	if s.Health != "" {
+		d += " / " + s.Health
+	}
+	if strings.EqualFold(s.State, "exited") {
+		d += fmt.Sprintf(" (code %d)", s.ExitCode)
+	}
+	return d
+}
+
+// anyPending reports whether any service is still settling, so the poll loop
+// keeps waiting rather than judging a healthcheck that hasn't finished.
+func anyPending(svcs []composePS) bool {
+	for _, s := range svcs {
+		state := strings.ToLower(s.State)
+		health := strings.ToLower(s.Health)
+		if health == "starting" || state == "created" || state == "restarting" {
+			return true
+		}
+	}
+	return false
+}
+
+// parseComposePS decodes `docker compose ps --format json`, tolerating both the
+// NDJSON (one object per line) and JSON-array shapes different compose versions
+// emit. The bool is false only when the output looks like JSON we couldn't
+// decode (so the caller degrades instead of trusting a half-read result).
+func parseComposePS(out string) ([]composePS, bool) {
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return nil, true
+	}
+	if strings.HasPrefix(out, "[") {
+		var arr []composePS
+		if err := json.Unmarshal([]byte(out), &arr); err != nil {
+			return nil, false
+		}
+		return arr, true
+	}
+	var svcs []composePS
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var s composePS
+		if err := json.Unmarshal([]byte(line), &s); err != nil {
+			return nil, false
+		}
+		svcs = append(svcs, s)
+	}
+	return svcs, true
 }
 
 // injectToken embeds a GitHub token into an https clone URL. Non-https URLs

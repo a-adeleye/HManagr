@@ -8,7 +8,7 @@ import { FitAddon } from '@xterm/addon-fit'
 
 import {
   ListVPS, AddVPS, UpdateVPS, DeleteVPS,
-  Connect, Disconnect, IsConnected,
+  Connect, TrustHostKey, ForgetHostKey, Disconnect, IsConnected,
   ListFiles, DownloadFile, UploadFile, DeleteRemoteFile, MakeDir, DefaultDownloadDir,
   StatRemoteFile, ChmodRemoteFile, ChownRemoteFile,
   SetSudoPassword, HasSudoPassword,
@@ -25,6 +25,9 @@ import {
   InspectTeardown, TeardownStack,
   ListBackupJobs, SaveBackupJob, DeleteBackupJob, RunBackupNow,
   ListBackupSnapshots, ForgetBackupSnapshot, TestBackupTarget, RestoreBackup,
+  SystemUsage, PruneDocker, SystemLargestImages,
+  ProvisionDatabaseEngines, ProvisionDatabase,
+  DetectCaddyProxy, ExposeServiceDomain, CloudflareUpsert,
 } from '../wailsjs/go/main/App'
 import { EventsOn } from '../wailsjs/runtime/runtime'
 
@@ -71,6 +74,12 @@ const shQuote = (p) => "'" + String(p).replace(/'/g, `'\\''`) + "'"
 
 // ─────────── Helpers ───────────
 const $ = (id) => document.getElementById(id)
+
+// esc HTML-escapes a value before it goes into innerHTML (container names,
+// images, domains, etc. can carry characters that would break markup).
+const esc = (s) =>
+  String(s ?? '').replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
 const fmtSize = (n) => {
   if (n < 1024) return n + ' B'
   if (n < 1024 ** 2) return (n / 1024).toFixed(1) + ' KB'
@@ -371,7 +380,7 @@ async function submitProjectForm(e) {
 }
 
 // ─────────── Connection ───────────
-async function doConnect() {
+async function doConnect(trust = false) {
   if (!state.selectedId) return
   const btn = $('connect-btn')
   btn.textContent = 'Connecting…'
@@ -379,7 +388,32 @@ async function doConnect() {
   $('status-pill').textContent = 'Connecting'
   $('status-pill').className = 'status-pill connecting'
   try {
-    await Connect(state.selectedId)
+    const res = await (trust ? TrustHostKey : Connect)(state.selectedId)
+    // Unknown host key (first connection): show the fingerprint and let the user
+    // decide whether to trust it (trust-on-first-use).
+    if (res && res.needsTrust) {
+      const ok = confirm(
+        `Unknown SSH host key for ${res.host}\n\n` +
+        `${res.keyType} fingerprint:\n${res.fingerprint}\n\n` +
+        `This is the first time connecting to this server. ` +
+        `Verify the fingerprint matches the server, then trust it and continue?`)
+      if (ok) return doConnect(true)
+      throw new Error('Host key not trusted — connection cancelled.')
+    }
+    // Changed host key: a possible man-in-the-middle. Make the user opt in loudly.
+    if (res && res.keyChanged) {
+      const ok = confirm(
+        `⚠ WARNING: the SSH host key for ${res.host} has CHANGED.\n\n` +
+        `New ${res.keyType} fingerprint:\n${res.fingerprint}\n\n` +
+        `This happens if the server was rebuilt — but also if the connection is ` +
+        `being intercepted (man-in-the-middle). Only continue if you KNOW the ` +
+        `server legitimately changed.\n\nForget the old key and trust the new one?`)
+      if (ok) {
+        await ForgetHostKey(state.selectedId)
+        return doConnect(true)
+      }
+      throw new Error('Host key changed — connection refused.')
+    }
     state.connected = true
     updateStatusUI()
     renderVPSList()
@@ -432,6 +466,18 @@ function loadCurrentTab() {
   }
   if (state.tab === 'cleanup') {
     cleanupOpen()
+    return
+  }
+  if (state.tab === 'domains') {
+    domainsOpen()
+    return
+  }
+  if (state.tab === 'provision') {
+    provisionOpen()
+    return
+  }
+  if (state.tab === 'maintenance') {
+    maintenanceOpen()
     return
   }
   if (!state.connected) return
@@ -2439,6 +2485,315 @@ async function bakDoRestore() {
     .catch((e) => finish('✗ Failed to start: ' + errMsg(e), 'err'))
 }
 
+// ─────────── Maintenance (disk / docker usage + prune) ───────────
+const maint = { pruneOff: null }
+const maintSudo = () => $('maint-sudo').checked
+
+async function maintenanceOpen() {
+  if (!state.selectedId) {
+    $('maint-disk').innerHTML = '<span class="muted">Select a server first.</span>'
+    $('maint-docker').textContent = ''
+    $('maint-images').textContent = ''
+    return
+  }
+  maintPruneToggle(false)
+  await maintRefresh()
+}
+
+async function maintRefresh() {
+  $('maint-disk').innerHTML = '<span class="muted">Loading…</span>'
+  $('maint-docker').textContent = ''
+  try {
+    const u = await SystemUsage(state.selectedId, maintSudo())
+    maintRenderDisk(u.disk)
+    maintRenderDocker(u.docker)
+  } catch (e) {
+    $('maint-disk').innerHTML = '<span class="muted">Failed: ' + esc(errMsg(e)) + '</span>'
+    $('maint-docker').textContent = ''
+  }
+  maintLoadImages()
+}
+
+function maintRenderDisk(d) {
+  const el = $('maint-disk')
+  if (!d || !d.available) {
+    el.innerHTML = '<span class="muted">Couldn’t read disk usage.</span>'
+    return
+  }
+  const pct = d.usePercent
+  const cls = pct >= 90 ? ' danger' : pct >= 75 ? ' warn-bar' : ''
+  el.innerHTML = `
+    <div class="card-title">Disk — ${esc(d.mountPoint)} <span class="muted">(${esc(d.filesystem)})</span></div>
+    <div class="usage-bar"><div class="usage-fill${cls}" style="width:${pct}%"></div></div>
+    <div class="muted" style="font-size:12px;margin-top:4px;">${esc(d.usedHuman)} of ${esc(d.totalHuman)} used · ${esc(d.availHuman)} free · ${pct}%</div>`
+}
+
+function maintRenderDocker(dk) {
+  const el = $('maint-docker')
+  if (!dk || !dk.available) {
+    el.innerHTML = '<span class="muted">Docker disk usage unavailable.</span>'
+    return
+  }
+  const row = (c) =>
+    `<tr><td>${esc(c.type)}</td><td>${c.totalCount} <span class="muted">(${c.activeCount} active)</span></td><td>${esc(c.sizeHuman)}</td><td>${esc(c.reclaimableHuman)}</td></tr>`
+  el.innerHTML = `
+    <div class="card-title">Docker</div>
+    <table class="mini-table"><thead><tr><th></th><th>count</th><th>size</th><th>reclaimable</th></tr></thead>
+    <tbody>${row(dk.images)}${row(dk.containers)}${row(dk.volumes)}${row(dk.buildCache)}</tbody></table>
+    <div class="muted" style="font-size:12px;margin-top:6px;">Total ${esc(dk.totalHuman)} · ${esc(dk.reclaimableHuman)} reclaimable</div>`
+}
+
+async function maintLoadImages() {
+  const el = $('maint-images')
+  el.innerHTML = '<span class="muted">Loading…</span>'
+  try {
+    const imgs = await SystemLargestImages(state.selectedId, 10, maintSudo())
+    if (!imgs || !imgs.length) {
+      el.innerHTML = '<span class="muted">No images.</span>'
+      return
+    }
+    el.innerHTML = imgs
+      .map((i) => `<div class="img-row"><span class="mono">${esc(i.repository)}:${esc(i.tag)}</span><span class="muted">${esc(i.sizeHuman)}</span></div>`)
+      .join('')
+  } catch {
+    el.innerHTML = '<span class="muted">Couldn’t list images.</span>'
+  }
+}
+
+function maintPruneToggle(show) {
+  $('maint-prune-view').classList.toggle('hidden', !show)
+  if (!show) $('maint-prune-log').classList.add('hidden')
+}
+
+async function maintRunPrune() {
+  const opts = { allImages: $('maint-prune-images').checked, volumes: $('maint-prune-volumes').checked }
+  if (opts.volumes && !confirm('Removing unused volumes permanently deletes their data. Continue?')) return
+  const log = $('maint-prune-log')
+  log.classList.remove('hidden')
+  log.textContent = ''
+  $('maint-prune-run').disabled = true
+  if (maint.pruneOff) { maint.pruneOff(); maint.pruneOff = null }
+  maint.pruneOff = EventsOn('maintenance-prune', (line) => {
+    log.textContent += line + '\n'
+    log.scrollTop = log.scrollHeight
+  })
+  try {
+    await PruneDocker(state.selectedId, opts, maintSudo())
+    log.textContent += '\n✓ Done.\n'
+    await maintRefresh()
+  } catch (e) {
+    log.textContent += '\n✗ ' + errMsg(e) + '\n'
+  } finally {
+    if (maint.pruneOff) { maint.pruneOff(); maint.pruneOff = null }
+    $('maint-prune-run').disabled = false
+  }
+}
+
+// ─────────── Provision a database ───────────
+const prov = { engines: [], runOff: null }
+
+async function provisionOpen() {
+  $('prov-form-view').classList.remove('hidden')
+  $('prov-run-view').classList.add('hidden')
+  if (!prov.engines.length) {
+    try {
+      prov.engines = (await ProvisionDatabaseEngines()) || []
+    } catch {
+      prov.engines = []
+    }
+    $('prov-engine').innerHTML = prov.engines
+      .map((e, i) => `<option value="${i}">${esc(e.label)}</option>`)
+      .join('')
+    $('prov-engine').onchange = provEngineChange
+  }
+  provEngineChange()
+}
+
+function provCurrentEngine() {
+  return prov.engines[parseInt($('prov-engine').value || '0', 10)] || null
+}
+
+function provEngineChange() {
+  const e = provCurrentEngine()
+  if (!e) return
+  $('prov-tag').innerHTML = (e.tags || []).map((t) => `<option value="${esc(t)}">${esc(t)}</option>`).join('')
+  $('prov-user-field').classList.toggle('hidden', !e.needsUser)
+  $('prov-db-field').classList.toggle('hidden', !e.needsDB)
+  $('prov-pass-field').classList.toggle('hidden', !e.needsAuth)
+  if (e.needsUser && !$('prov-user').value) $('prov-user').value = e.defaultUser || ''
+}
+
+async function provisionRun() {
+  const e = provCurrentEngine()
+  if (!e) return
+  const name = $('prov-name').value.trim()
+  const dir = $('prov-dir').value.trim()
+  const err = $('prov-err')
+  err.classList.add('hidden')
+  if (!/^[A-Za-z][A-Za-z0-9_-]{0,62}$/.test(name)) {
+    err.textContent = 'Name must start with a letter and use only letters, digits, - or _.'
+    err.classList.remove('hidden')
+    return
+  }
+  if (!dir) {
+    err.textContent = 'Enter a target directory on the VPS.'
+    err.classList.remove('hidden')
+    return
+  }
+  const spec = {
+    engine: e.kind,
+    dir,
+    name,
+    tag: $('prov-tag').value,
+    user: e.needsUser ? $('prov-user').value.trim() : '',
+    database: e.needsDB ? $('prov-db').value.trim() : '',
+    password: e.needsAuth ? $('prov-pass').value : '',
+    exposePort: parseInt($('prov-port').value || '0', 10) || 0,
+    volumeName: '',
+  }
+  $('prov-form-view').classList.add('hidden')
+  $('prov-run-view').classList.remove('hidden')
+  const log = $('prov-log')
+  log.textContent = ''
+  $('prov-result').classList.add('hidden')
+  $('prov-reset').classList.add('hidden')
+  if (prov.runOff) { prov.runOff(); prov.runOff = null }
+  prov.runOff = EventsOn('provision-db', (line) => {
+    log.textContent += line + '\n'
+    log.scrollTop = log.scrollHeight
+  })
+  try {
+    const res = await ProvisionDatabase(state.selectedId, spec, $('prov-sudo').checked)
+    log.textContent += '\n✓ Database is up.\n'
+    const r = $('prov-result')
+    r.classList.remove('hidden')
+    r.innerHTML = `
+      <div class="result-card">
+        <div class="card-title">Save the password now — it won't be shown again</div>
+        <div class="kv"><span>Container</span><code>${esc(res.containerName)}</code></div>
+        <div class="kv"><span>Image</span><code>${esc(res.image)}</code></div>
+        <div class="kv"><span>Volume</span><code>${esc(res.volumeName)}</code></div>
+        <div class="kv"><span>Password</span><code>${esc(res.password)}</code></div>
+        ${res.backupEngine ? '<p class="muted" style="font-size:12px;margin:8px 0 0;">Add this container to a Backup job (engine: ' + esc(res.backupEngine) + ') to schedule dumps.</p>' : ''}
+      </div>`
+  } catch (e2) {
+    log.textContent += '\n✗ ' + errMsg(e2) + '\n'
+  } finally {
+    if (prov.runOff) { prov.runOff(); prov.runOff = null }
+    $('prov-reset').classList.remove('hidden')
+  }
+}
+
+// ─────────── Domains (expose via caddy-docker-proxy + Cloudflare DNS) ───────────
+const dom = { exposeOff: null }
+
+function domainsOpen() {
+  $('dom-form-view').classList.remove('hidden')
+  $('dom-run-view').classList.add('hidden')
+}
+
+async function domDetect() {
+  const card = $('dom-proxy')
+  if (!state.selectedId) { card.textContent = 'Select a server first.'; return }
+  card.className = 'info-card muted'
+  card.textContent = 'Detecting…'
+  try {
+    const p = await DetectCaddyProxy(state.selectedId, $('dom-sudo').checked)
+    if (p && p.present) {
+      card.className = 'info-card ok'
+      card.innerHTML =
+        `caddy-docker-proxy detected: <code>${esc(p.container)}</code> <span class="muted">(${esc(p.image)})</span>` +
+        (p.network ? `<br><span class="muted">routing network: ${esc(p.network)}</span>` : '')
+      if (p.network && !$('dom-network').value) $('dom-network').value = p.network
+    } else {
+      card.className = 'info-card warn-card'
+      card.innerHTML =
+        'No caddy-docker-proxy found on this host — the label path won’t route until one is running. You can still set up DNS below.'
+    }
+  } catch (e) {
+    card.className = 'info-card'
+    card.textContent = 'Detection failed: ' + errMsg(e)
+  }
+}
+
+async function domExpose() {
+  const err = $('dom-err')
+  err.classList.add('hidden')
+  const domains = $('dom-domains').value.trim().split(/\s+/).filter(Boolean)
+  const port = parseInt($('dom-port').value || '0', 10)
+  const spec = {
+    stackPath: $('dom-path').value.trim(),
+    mainCompose: $('dom-compose').value.trim(),
+    service: $('dom-service').value.trim(),
+    domains,
+    port,
+    network: $('dom-network').value.trim(),
+    overrideName: '',
+  }
+  if (!spec.stackPath || !spec.mainCompose || !spec.service || !domains.length || !port) {
+    err.textContent = 'Fill in stack directory, compose file, service, at least one domain, and the port.'
+    err.classList.remove('hidden')
+    return
+  }
+  $('dom-form-view').classList.add('hidden')
+  $('dom-run-view').classList.remove('hidden')
+  const log = $('dom-log')
+  log.textContent = ''
+  $('dom-outcome').classList.add('hidden')
+  $('dom-reset').classList.add('hidden')
+  if (dom.exposeOff) { dom.exposeOff(); dom.exposeOff = null }
+  dom.exposeOff = EventsOn('caddy-expose', (line) => {
+    log.textContent += line + '\n'
+    log.scrollTop = log.scrollHeight
+  })
+  try {
+    await ExposeServiceDomain(state.selectedId, spec, $('dom-sudo').checked)
+    domFinish('✓ Service exposed. Caddy obtains a certificate on first request to the domain.', 'ok')
+  } catch (e) {
+    domFinish('✗ ' + errMsg(e), 'err')
+  } finally {
+    if (dom.exposeOff) { dom.exposeOff(); dom.exposeOff = null }
+    $('dom-reset').classList.remove('hidden')
+  }
+}
+
+function domFinish(msg, kind) {
+  const o = $('dom-outcome')
+  o.className = kind === 'ok' ? 'ok-msg' : 'err-msg'
+  o.textContent = msg
+  o.classList.remove('hidden')
+}
+
+async function domCloudflare() {
+  const msg = $('dom-cf-msg')
+  msg.classList.add('hidden')
+  const token = $('dom-cf-token').value.trim()
+  const zone = $('dom-cf-zone').value.trim()
+  const name = $('dom-cf-name').value.trim()
+  const ip = $('dom-cf-ip').value.trim()
+  if (!token || !zone || !name || !ip) {
+    msg.className = 'err-msg'
+    msg.textContent = 'Fill token, zone, record name and IPv4.'
+    msg.classList.remove('hidden')
+    return
+  }
+  const btn = $('dom-cf-apply')
+  btn.disabled = true
+  btn.textContent = 'Working…'
+  try {
+    await CloudflareUpsert(token, zone, name, ip, $('dom-cf-proxied').checked)
+    msg.className = 'ok-msg'
+    msg.textContent = '✓ DNS record set: ' + name + ' → ' + ip
+  } catch (e) {
+    msg.className = 'err-msg'
+    msg.textContent = '✗ ' + errMsg(e)
+  } finally {
+    msg.classList.remove('hidden')
+    btn.disabled = false
+    btn.textContent = 'Create / update DNS'
+  }
+}
+
 // ─────────── Tabs ───────────
 // setActiveTab handles only the visual switch; switchTab also loads the tab's
 // content. They're separate so the logs view can show the terminal panel
@@ -2555,6 +2910,22 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.tab').forEach((t) => {
     t.addEventListener('click', () => switchTab(t.dataset.tab))
   })
+
+  // Maintenance
+  $('maint-refresh').addEventListener('click', maintRefresh)
+  $('maint-prune').addEventListener('click', () => maintPruneToggle(true))
+  $('maint-prune-cancel').addEventListener('click', () => maintPruneToggle(false))
+  $('maint-prune-run').addEventListener('click', maintRunPrune)
+
+  // Provision
+  $('prov-run').addEventListener('click', provisionRun)
+  $('prov-reset').addEventListener('click', () => switchTab('provision'))
+
+  // Domains
+  $('dom-detect').addEventListener('click', domDetect)
+  $('dom-expose').addEventListener('click', domExpose)
+  $('dom-cf-apply').addEventListener('click', domCloudflare)
+  $('dom-reset').addEventListener('click', () => switchTab('domains'))
 
   // Permissions modal
   $('perms-cancel').addEventListener('click', closePermsModal)

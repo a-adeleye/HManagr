@@ -7,8 +7,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <script type="module" crossorigin src="/assets/index-B3pqOL53.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/index-CjO3edeS.css">
+  <script type="module" crossorigin src="/assets/index-BHAqUUf_.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-HAOAkVqE.css">
 </head>
 <body>
   <div id="app">
@@ -63,6 +63,9 @@
           <button data-tab="deploy" class="tab">Deploy</button>
           <button data-tab="migration" class="tab">Migration</button>
           <button data-tab="backups" class="tab">Backups</button>
+          <button data-tab="domains" class="tab">Domains</button>
+          <button data-tab="provision" class="tab">New DB</button>
+          <button data-tab="maintenance" class="tab">Maintenance</button>
           <button data-tab="cleanup" class="tab">Cleanup</button>
         </nav>
 
@@ -481,6 +484,150 @@
               <div class="modal-actions" style="margin-top:12px;">
                 <button id="cleanup-reset" class="btn btn-secondary hidden">Done</button>
               </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ───── Domains: expose a service via caddy-docker-proxy ───── -->
+        <section id="tab-domains" class="tab-panel">
+          <div class="migration">
+            <div id="dom-form-view" class="mig-stage">
+              <h3>Expose a service on a domain</h3>
+              <p class="muted" style="font-size:13px;margin:0 0 12px;">
+                Routes a compose service to a hostname with automatic HTTPS via your
+                <code>caddy-docker-proxy</code>, by adding labels through a compose
+                <em>override</em> file — your own compose file is left untouched.
+              </p>
+              <div id="dom-proxy" class="info-card muted">Click “Detect proxy” to check this host.</div>
+              <label class="checkbox-row" style="margin:8px 0 4px;">
+                <input type="checkbox" id="dom-sudo" checked /><span>Use sudo</span>
+              </label>
+              <div class="modal-actions" style="margin:0 0 14px;">
+                <button id="dom-detect" class="btn btn-secondary">Detect proxy</button>
+              </div>
+              <label>Stack directory on VPS<input type="text" id="dom-path" placeholder="/opt/app" class="mono" /></label>
+              <label>Compose file<input type="text" id="dom-compose" placeholder="docker-compose.yml" class="mono" /></label>
+              <div class="row">
+                <label>Service<input type="text" id="dom-service" placeholder="web" class="mono" /></label>
+                <label>Container port<input type="number" id="dom-port" placeholder="3000" min="1" max="65535" /></label>
+              </div>
+              <label>Domain(s), space-separated<input type="text" id="dom-domains" placeholder="app.example.com" class="mono" /></label>
+              <label>Attach proxy network (optional)<input type="text" id="dom-network" placeholder="caddy" class="mono" /></label>
+              <div class="modal-actions" style="margin-top:12px;">
+                <button id="dom-expose" class="btn">Expose</button>
+              </div>
+              <p id="dom-err" class="err-msg hidden"></p>
+
+              <h4 style="margin:22px 0 4px;">Cloudflare DNS (optional)</h4>
+              <p class="muted" style="font-size:12px;margin:0 0 8px;">
+                Point the domain at this VPS. The API token stays on your computer — it is never sent to the server.
+              </p>
+              <label>API token<input type="password" id="dom-cf-token" autocomplete="off" /></label>
+              <div class="row">
+                <label>Zone<input type="text" id="dom-cf-zone" placeholder="example.com" class="mono" /></label>
+                <label>Record name<input type="text" id="dom-cf-name" placeholder="app.example.com" class="mono" /></label>
+              </div>
+              <div class="row">
+                <label>VPS IPv4<input type="text" id="dom-cf-ip" placeholder="203.0.113.10" class="mono" /></label>
+                <label class="checkbox-row" style="align-self:end;margin-bottom:8px;">
+                  <input type="checkbox" id="dom-cf-proxied" /><span>Proxy (orange cloud)</span>
+                </label>
+              </div>
+              <div class="modal-actions" style="margin-top:4px;">
+                <button id="dom-cf-apply" class="btn btn-secondary">Create / update DNS</button>
+              </div>
+              <p id="dom-cf-msg" class="hidden" style="margin-top:8px;"></p>
+            </div>
+
+            <div id="dom-run-view" class="mig-stage hidden">
+              <h3>Exposing service</h3>
+              <pre id="dom-log" class="mig-log mono"></pre>
+              <div id="dom-outcome" class="hidden"></div>
+              <div class="modal-actions" style="margin-top:12px;">
+                <button id="dom-reset" class="btn btn-secondary hidden">Done</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ───── Provision: stand up a managed database ───── -->
+        <section id="tab-provision" class="tab-panel">
+          <div class="migration">
+            <div id="prov-form-view" class="mig-stage">
+              <h3>Provision a database</h3>
+              <p class="muted" style="font-size:13px;margin:0 0 12px;">
+                Stands up a managed database as its own docker-compose stack. It then appears
+                in the Databases tab and can be backed up. No host port is exposed by default —
+                access is over <code>docker exec</code>.
+              </p>
+              <label>Engine<select id="prov-engine"></select></label>
+              <div class="row">
+                <label>Name<input type="text" id="prov-name" placeholder="app-pg" class="mono" /></label>
+                <label>Version<select id="prov-tag"></select></label>
+              </div>
+              <label>Directory on VPS<input type="text" id="prov-dir" placeholder="/opt/databases/app-pg" class="mono" /></label>
+              <div class="row">
+                <label id="prov-user-field">User<input type="text" id="prov-user" class="mono" /></label>
+                <label id="prov-db-field">Initial database<input type="text" id="prov-db" class="mono" /></label>
+              </div>
+              <label id="prov-pass-field">Password (blank = auto-generate)<input type="password" id="prov-pass" class="mono" autocomplete="off" /></label>
+              <label>Expose host port (optional, 0 = internal only)<input type="number" id="prov-port" placeholder="0" min="0" max="65535" /></label>
+              <label class="checkbox-row"><input type="checkbox" id="prov-sudo" checked /><span>Use sudo</span></label>
+              <div class="modal-actions" style="margin-top:12px;">
+                <button id="prov-run" class="btn">Provision</button>
+              </div>
+              <p id="prov-err" class="err-msg hidden"></p>
+            </div>
+
+            <div id="prov-run-view" class="mig-stage hidden">
+              <h3>Provisioning database</h3>
+              <pre id="prov-log" class="mig-log mono"></pre>
+              <div id="prov-result" class="hidden"></div>
+              <div class="modal-actions" style="margin-top:12px;">
+                <button id="prov-reset" class="btn btn-secondary hidden">Done</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ───── Maintenance: disk / docker usage + prune ───── -->
+        <section id="tab-maintenance" class="tab-panel">
+          <div class="migration">
+            <div class="mig-stage">
+              <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:4px;">
+                <h3 style="margin:0;">System maintenance</h3>
+                <span>
+                  <label class="checkbox-row" style="display:inline-flex;margin:0 12px 0 0;">
+                    <input type="checkbox" id="maint-sudo" checked /><span>Use sudo</span>
+                  </label>
+                  <button id="maint-refresh" class="btn btn-secondary">Refresh</button>
+                </span>
+              </div>
+              <p class="muted" style="font-size:13px;margin:0 0 12px;">
+                Disk and Docker space on the selected host. Reclaim unused Docker data safely.
+              </p>
+              <div id="maint-disk" class="info-card">—</div>
+              <div id="maint-docker" class="info-card">—</div>
+              <div class="modal-actions" style="margin-top:10px;">
+                <button id="maint-prune" class="btn btn-danger">Reclaim space…</button>
+              </div>
+
+              <div id="maint-prune-view" class="hidden" style="margin-top:14px;">
+                <h4 style="margin:0 0 8px;">Reclaim Docker space</h4>
+                <p class="muted" style="font-size:12px;margin:0 0 8px;">
+                  The default removes stopped containers, dangling images, unused networks and build cache. Safe.
+                </p>
+                <label class="checkbox-row"><input type="checkbox" id="maint-prune-images" /><span>Also remove <strong>all</strong> unused images (<code>-a</code>)</span></label>
+                <label class="checkbox-row" style="margin-bottom:8px;"><input type="checkbox" id="maint-prune-volumes" /><span class="warn">Also remove unused volumes — permanently deletes data (<code>--volumes</code>)</span></label>
+                <div class="modal-actions">
+                  <button id="maint-prune-cancel" class="btn btn-secondary">Cancel</button>
+                  <button id="maint-prune-run" class="btn btn-danger">Prune now</button>
+                </div>
+                <pre id="maint-prune-log" class="mig-log mono hidden"></pre>
+              </div>
+
+              <h4 style="margin:18px 0 6px;">Largest images</h4>
+              <div id="maint-images" class="info-card muted">—</div>
             </div>
           </div>
         </section>
