@@ -8,13 +8,93 @@ import (
 	"strings"
 )
 
+// ComposeContext is the compose project name + config file(s) a running stack
+// actually uses, recovered from its containers' compose labels. It lets the
+// migration drive `docker compose` with the correct -p/-f even when the file has
+// a non-standard name, the project name differs from the directory, or multiple
+// -f files (incl. override files) were used.
+type ComposeContext struct {
+	Project      string   `json:"project"`
+	ComposeFiles []string `json:"composeFiles"`
+}
+
+// composeFlags renders `-p <project>` and one `-f` per file (each only when set),
+// with a trailing space so it slots straight before the subcommand. An empty
+// files slice emits no -f, so `docker compose` keeps its native default-file +
+// override-file auto-merge.
+func composeFlags(project string, files []string) string {
+	var b strings.Builder
+	if p := strings.TrimSpace(project); p != "" {
+		b.WriteString("-p " + shellQuote(p) + " ")
+	}
+	for _, f := range files {
+		if f = strings.TrimSpace(f); f != "" {
+			b.WriteString("-f " + shellQuote(f) + " ")
+		}
+	}
+	return b.String()
+}
+
+// DiscoverComposeContext reads the compose project + config files a running stack
+// uses from its containers' labels (com.docker.compose.project[.config_files]),
+// matched by working_dir. It keeps ALL config files (so override files and
+// multi-`-f` setups migrate faithfully) and resolves symlinked/non-canonical
+// source paths. Returns zero values when nothing matches (the stack isn't
+// running or wasn't started by compose).
+func DiscoverComposeContext(ctx context.Context, exec ExecFn, dir string) ComposeContext {
+	d := strings.TrimRight(strings.TrimSpace(dir), "/")
+	// Compose stores the canonical absolute working_dir; resolve the user's path
+	// so a symlink/relative form still matches the label.
+	if res, err := exec(ctx, "readlink -f "+shellQuote(d)); err == nil && res != nil && res.ExitCode == 0 {
+		if rp := strings.TrimSpace(res.Stdout); rp != "" {
+			d = strings.TrimRight(rp, "/")
+		}
+	}
+	format := `{{.Label "com.docker.compose.project"}}` + "\t" + `{{.Label "com.docker.compose.project.config_files"}}`
+	cmd := "docker ps -a --filter " + shellQuote("label=com.docker.compose.project.working_dir="+d) + " --format " + shellQuote(format)
+	res, err := exec(ctx, cmd)
+	if err != nil || res == nil || res.ExitCode != 0 {
+		return ComposeContext{}
+	}
+	for _, line := range strings.Split(strings.TrimSpace(res.Stdout), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		proj := strings.TrimSpace(parts[0])
+		var files []string
+		for _, fp := range strings.Split(parts[1], ",") {
+			fp = strings.TrimSpace(fp)
+			if fp == "" {
+				continue
+			}
+			if rel, ok := relUnder(d, fp); ok {
+				files = append(files, rel)
+			} else {
+				files = append(files, fp) // out-of-dir compose file: keep absolute -f
+			}
+		}
+		if proj != "" || len(files) > 0 {
+			return ComposeContext{Project: proj, ComposeFiles: files}
+		}
+	}
+	return ComposeContext{}
+}
+
 // docker-compose config --format json produces a normalized stack description.
 // We only decode the bits we care about; the rest is left as raw JSON.
 type composeConfig struct {
-	Name     string                    `json:"name"`
-	Services map[string]composeService `json:"services"`
-	Volumes  map[string]any            `json:"volumes"`
-	Networks map[string]composeNetwork `json:"networks"`
+	Name     string                      `json:"name"`
+	Services map[string]composeService   `json:"services"`
+	Volumes  map[string]composeVolumeDef `json:"volumes"`
+	Networks map[string]composeNetwork   `json:"networks"`
+}
+
+// composeVolumeDef is a top-level volume declaration. External volumes aren't
+// created by compose (no <project>_ prefix) and keep their real name.
+type composeVolumeDef struct {
+	Name     string   `json:"name"`
+	External flexBool `json:"external"`
 }
 
 type composeNetwork struct {
@@ -89,8 +169,8 @@ type composeVolume struct {
 // and returns the resolved inventory the wizard will show. Taking ExecFn (not
 // *sshpkg.Connection) lets the App layer inject a sudo-wrapped exec when the
 // user opts into that.
-func Inspect(ctx context.Context, exec ExecFn, sourcePath string) (*Inventory, error) {
-	cmd := fmt.Sprintf("cd %s && docker compose config --format json", shellQuote(sourcePath))
+func Inspect(ctx context.Context, exec ExecFn, sourcePath string, composeFiles []string, projectName string) (*Inventory, error) {
+	cmd := fmt.Sprintf("cd %s && docker compose %sconfig --format json", shellQuote(sourcePath), composeFlags(projectName, composeFiles))
 	res, err := exec(ctx, cmd)
 	if err != nil {
 		return nil, err
@@ -121,19 +201,33 @@ func Inspect(ctx context.Context, exec ExecFn, sourcePath string) (*Inventory, e
 			Builds:     svc.builds(),
 		})
 		if svc.builds() {
+			// A build service's image is produced locally — always ship it.
 			if img := resolveBuildImage(ctx, exec, cfg.Name, name, svc.Image); img != "" && !seenImg[img] {
 				seenImg[img] = true
 				inv.BuildImages = append(inv.BuildImages, img)
 			}
+		} else if svc.Image != "" && !seenImg[svc.Image] && isLocalOnlyImage(ctx, exec, svc.Image) {
+			// A non-build service that references an image which is present on the
+			// source but NOT pullable from a registry (e.g. a CI-built tag like
+			// app:<gitsha>) — the target can't pull it, so ship it too.
+			seenImg[svc.Image] = true
+			inv.BuildImages = append(inv.BuildImages, svc.Image)
 		}
 		for _, v := range svc.Volumes {
 			switch v.Type {
 			case "volume":
-				// Declared volumes get the project-name prefix when docker
-				// creates them. External / anonymous volumes don't.
+				// Declared, non-external volumes get the project-name prefix when
+				// docker creates them. External volumes keep their real name (the
+				// `name:` field, or the key); anonymous ones pass through as-is.
 				full := v.Source
-				if _, declared := cfg.Volumes[v.Source]; declared {
-					full = cfg.Name + "_" + v.Source
+				if def, declared := cfg.Volumes[v.Source]; declared {
+					if bool(def.External) {
+						if def.Name != "" {
+							full = def.Name
+						}
+					} else {
+						full = cfg.Name + "_" + v.Source
+					}
 				}
 				if !seenVol[full] {
 					seenVol[full] = true
@@ -195,10 +289,33 @@ func Inspect(ctx context.Context, exec ExecFn, sourcePath string) (*Inventory, e
 	}
 	if len(inv.BuildImages) > 0 {
 		inv.Warnings = append(inv.Warnings,
-			"built image(s) "+strings.Join(inv.BuildImages, ", ")+
-				" will be shipped prebuilt (docker save/load) so the target needn't rebuild from source")
+			"image(s) not available from a registry ("+strings.Join(inv.BuildImages, ", ")+
+				") will be copied from the source (docker save/load) so the target needn't pull or rebuild them")
 	}
 	return inv, nil
+}
+
+// isLocalOnlyImage reports whether image is present on the source but cannot be
+// pulled from a registry — i.e. a locally-built / CI-tagged image the target
+// would fail to pull. Registry images (postgres:16, …) return false so the
+// target just pulls them. If `docker manifest inspect` isn't supported, we
+// assume the image is pullable rather than mass-shipping every public image.
+func isLocalOnlyImage(ctx context.Context, exec ExecFn, image string) bool {
+	if !imageExists(ctx, exec, image) {
+		return false // not on the source; nothing to ship (target will pull)
+	}
+	res, err := exec(ctx, "docker manifest inspect "+shellQuote(image))
+	if err != nil || res == nil {
+		return false
+	}
+	if res.ExitCode == 0 {
+		return false // pullable from a registry
+	}
+	out := strings.ToLower(res.Stderr + res.Stdout)
+	if strings.Contains(out, "not a docker command") || strings.Contains(out, "is not a docker") {
+		return false // old docker without `manifest` — don't assume local-only
+	}
+	return true // present locally, not pullable → ship it
 }
 
 // resolveBuildImage works out the docker image tag a build service resolves to.
@@ -246,6 +363,41 @@ func FindComposeFile(ctx context.Context, exec ExecFn, dir string) (string, erro
 		}
 	}
 	return "", fmt.Errorf("no compose file found in %s", dir)
+}
+
+// DiscoverStacks scans the immediate subdirectories of dir for compose files and
+// returns the ones that look like stacks. Used when dir itself has no compose
+// file — i.e. it's a parent folder holding several stacks. One level deep only,
+// so example/vendored compose files nested in build contexts aren't matched.
+func DiscoverStacks(ctx context.Context, exec ExecFn, dir string) ([]SubStack, error) {
+	// For each immediate subdir, print "<name>\t<composefile>" for the first
+	// compose file it contains.
+	script := "cd " + shellQuote(dir) + ` 2>/dev/null || exit 0
+for d in */; do
+  d="${d%/}"
+  for c in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+    if [ -f "$d/$c" ]; then printf '%s\t%s\n' "$d" "$c"; break; fi
+  done
+done`
+	res, err := exec(ctx, script)
+	if err != nil {
+		return nil, err
+	}
+	base := strings.TrimRight(dir, "/")
+	var out []SubStack
+	for _, line := range strings.Split(strings.TrimSpace(res.Stdout), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		out = append(out, SubStack{Name: parts[0], Path: base + "/" + parts[0], ComposeFile: parts[1]})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }
 
 func shellQuote(s string) string {

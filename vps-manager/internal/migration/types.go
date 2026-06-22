@@ -36,6 +36,14 @@ type Service struct {
 	Builds     bool   `json:"builds"` // has a build: section — its image is shipped prebuilt
 }
 
+// SubStack is one compose stack found in an immediate subdirectory of a parent
+// directory that has no compose file of its own (a multi-stack folder).
+type SubStack struct {
+	Name        string `json:"name"`        // subdirectory name
+	Path        string `json:"path"`        // full path on the source VPS
+	ComposeFile string `json:"composeFile"` // detected compose filename
+}
+
 type Volume struct {
 	Name     string `json:"name"`     // full docker volume name (project_volume)
 	Size     int64  `json:"size"`     // bytes, best-effort

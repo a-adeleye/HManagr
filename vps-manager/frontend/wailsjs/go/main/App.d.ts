@@ -3,6 +3,7 @@
 import {config} from '../models';
 import {db} from '../models';
 import {migration} from '../models';
+import {backup} from '../models';
 import {docker} from '../models';
 import {sftp} from '../models';
 import {main} from '../models';
@@ -45,6 +46,8 @@ export function DBUpdateRow(arg1:string,arg2:string,arg3:string,arg4:string,arg5
 
 export function DefaultDownloadDir():Promise<string>;
 
+export function DeleteBackupJob(arg1:string,arg2:string,arg3:boolean):Promise<void>;
+
 export function DeleteDeployment(arg1:string):Promise<void>;
 
 export function DeleteProject(arg1:string):Promise<void>;
@@ -55,15 +58,27 @@ export function DeleteVPS(arg1:string):Promise<void>;
 
 export function Disconnect(arg1:string):Promise<void>;
 
+export function DiscoverComposeContext(arg1:string,arg2:string,arg3:boolean):Promise<migration.ComposeContext>;
+
+export function DiscoverStacks(arg1:string,arg2:string,arg3:boolean):Promise<Array<migration.SubStack>>;
+
 export function DownloadFile(arg1:string,arg2:string,arg3:string):Promise<void>;
 
 export function FindComposeFile(arg1:string,arg2:string):Promise<string>;
 
+export function ForgetBackupSnapshot(arg1:string,arg2:string,arg3:string,arg4:boolean):Promise<void>;
+
 export function HasSudoPassword(arg1:string):Promise<boolean>;
 
-export function InspectMigration(arg1:string,arg2:string,arg3:boolean):Promise<migration.Inventory>;
+export function InspectMigration(arg1:string,arg2:string,arg3:Array<string>,arg4:string,arg5:boolean):Promise<migration.Inventory>;
+
+export function InspectTeardown(arg1:string,arg2:string,arg3:Array<string>,arg4:string,arg5:boolean):Promise<migration.Inventory>;
 
 export function IsConnected(arg1:string):Promise<boolean>;
+
+export function ListBackupJobs(arg1:string,arg2:boolean):Promise<Array<backup.Job>>;
+
+export function ListBackupSnapshots(arg1:string,arg2:string,arg3:boolean):Promise<Array<backup.Snapshot>>;
 
 export function ListContainers(arg1:string,arg2:string):Promise<Array<docker.Container>>;
 
@@ -91,6 +106,10 @@ export function ResizeShell(arg1:string,arg2:number,arg3:number):Promise<void>;
 
 export function RestartContainer(arg1:string,arg2:string):Promise<void>;
 
+export function RestoreBackup(arg1:string,arg2:backup.Job,arg3:backup.Secrets,arg4:backup.RestoreOptions,arg5:boolean):Promise<void>;
+
+export function RunBackupNow(arg1:string,arg2:string,arg3:boolean):Promise<void>;
+
 export function RunCommand(arg1:string,arg2:string):Promise<main.CommandResult>;
 
 export function RunContainerCommand(arg1:string,arg2:string,arg3:string):Promise<main.CommandResult>;
@@ -98,6 +117,10 @@ export function RunContainerCommand(arg1:string,arg2:string,arg3:string):Promise
 export function RunDeploy(arg1:string):Promise<void>;
 
 export function RunMigration(arg1:string,arg2:string,arg3:migration.RunOptions,arg4:boolean):Promise<void>;
+
+export function RunMultiMigration(arg1:string,arg2:string,arg3:string,arg4:string,arg5:Array<string>,arg6:boolean):Promise<void>;
+
+export function SaveBackupJob(arg1:string,arg2:backup.Job,arg3:backup.Secrets,arg4:boolean):Promise<backup.Job>;
 
 export function SaveDeployment(arg1:config.Deployment):Promise<config.Deployment>;
 
@@ -114,6 +137,10 @@ export function StartShell(arg1:string,arg2:number,arg3:number):Promise<void>;
 export function StatRemoteFile(arg1:string,arg2:string):Promise<main.PathInfo>;
 
 export function StopContainer(arg1:string,arg2:string):Promise<void>;
+
+export function TeardownStack(arg1:string,arg2:docker.TeardownOptions,arg3:boolean):Promise<void>;
+
+export function TestBackupTarget(arg1:string,arg2:backup.BucketRef,arg3:backup.Secrets,arg4:boolean):Promise<void>;
 
 export function UpdateVPS(arg1:config.VPS):Promise<void>;
 

@@ -22,7 +22,8 @@ type ExecFn func(ctx context.Context, cmd string) (*sshpkg.ExecResult, error)
 type RunOptions struct {
 	SourcePath  string
 	TargetPath  string
-	ComposeFile string   // filename inside SourcePath, e.g. "docker-compose.yml"
+	ComposeFiles []string // -f files (relative to the dir, or absolute); empty = compose auto-detects
+	ProjectName  string   // compose project name (-p); empty = dir-basename default
 	Volumes     []string // full docker volume names to archive+restore
 	EnvFiles    []string // resolved absolute paths on source
 	// ExternalNetworks are docker network names the compose file declares as
@@ -91,7 +92,7 @@ func Run(ctx context.Context, src, dst *sshpkg.Connection, srcExec, dstExec Exec
 	}
 
 	log("→ Stopping source stack (downtime begins)…")
-	if err := composeStop(ctx, srcExec, opts.SourcePath); err != nil {
+	if err := composeStop(ctx, srcExec, opts.SourcePath, opts.ProjectName, opts.ComposeFiles); err != nil {
 		return fmt.Errorf("compose stop on source: %w", err)
 	}
 
@@ -101,13 +102,13 @@ func Run(ctx context.Context, src, dst *sshpkg.Connection, srcExec, dstExec Exec
 		if err := archiveVolume(ctx, srcExec, vol, srcTmp); err != nil {
 			// Try to bring source back up before returning so the user isn't
 			// stuck with a stopped stack.
-			_ = composeUp(ctx, srcExec, opts.SourcePath)
+			_ = composeUp(ctx, srcExec, opts.SourcePath, opts.ProjectName, opts.ComposeFiles)
 			return fmt.Errorf("archive %s: %w", vol, err)
 		}
 	}
 
 	log("→ Restarting source stack (downtime ends)…")
-	if err := composeUp(ctx, srcExec, opts.SourcePath); err != nil {
+	if err := composeUp(ctx, srcExec, opts.SourcePath, opts.ProjectName, opts.ComposeFiles); err != nil {
 		log("  ⚠ source restart failed: " + err.Error())
 	}
 
@@ -203,7 +204,7 @@ func Run(ctx context.Context, src, dst *sshpkg.Connection, srcExec, dstExec Exec
 	}
 
 	log("→ Starting target stack…")
-	if err := composeUp(ctx, dstExec, opts.TargetPath); err != nil {
+	if err := composeUp(ctx, dstExec, opts.TargetPath, opts.ProjectName, opts.ComposeFiles); err != nil {
 		return fmt.Errorf("compose up on target: %w", err)
 	}
 
@@ -260,15 +261,15 @@ func chmodWorld(ctx context.Context, exec ExecFn, p string) error {
 	return nil
 }
 
-func composeStop(ctx context.Context, exec ExecFn, dir string) error {
-	return composeCmd(ctx, exec, dir, "stop")
+func composeStop(ctx context.Context, exec ExecFn, dir, project string, files []string) error {
+	return composeCmd(ctx, exec, dir, "stop", project, files)
 }
-func composeUp(ctx context.Context, exec ExecFn, dir string) error {
-	return composeCmd(ctx, exec, dir, "up -d")
+func composeUp(ctx context.Context, exec ExecFn, dir, project string, files []string) error {
+	return composeCmd(ctx, exec, dir, "up -d", project, files)
 }
 
-func composeCmd(ctx context.Context, exec ExecFn, dir, sub string) error {
-	cmd := fmt.Sprintf("cd %s && docker compose %s", shellQuote(dir), sub)
+func composeCmd(ctx context.Context, exec ExecFn, dir, sub, project string, files []string) error {
+	cmd := fmt.Sprintf("cd %s && docker compose %s%s", shellQuote(dir), composeFlags(project, files), sub)
 	res, err := exec(ctx, cmd)
 	if err != nil {
 		return err

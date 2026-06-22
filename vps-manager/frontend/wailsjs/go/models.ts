@@ -1,3 +1,171 @@
+export namespace backup {
+	
+	export class BucketRef {
+	    endpoint: string;
+	    region: string;
+	    bucket: string;
+	    prefix: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new BucketRef(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.endpoint = source["endpoint"];
+	        this.region = source["region"];
+	        this.bucket = source["bucket"];
+	        this.prefix = source["prefix"];
+	    }
+	}
+	export class DBTarget {
+	    container: string;
+	    engine: string;
+	    user: string;
+	    db: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DBTarget(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.container = source["container"];
+	        this.engine = source["engine"];
+	        this.user = source["user"];
+	        this.db = source["db"];
+	    }
+	}
+	export class RetentionPolicy {
+	    keepDaily: number;
+	    keepWeekly: number;
+	    keepMonthly: number;
+	    keepLast: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new RetentionPolicy(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.keepDaily = source["keepDaily"];
+	        this.keepWeekly = source["keepWeekly"];
+	        this.keepMonthly = source["keepMonthly"];
+	        this.keepLast = source["keepLast"];
+	    }
+	}
+	export class Job {
+	    id: string;
+	    name: string;
+	    stackPath: string;
+	    volumes: string[];
+	    databases: DBTarget[];
+	    includeCompose: boolean;
+	    schedule: string;
+	    retention: RetentionPolicy;
+	    bucket: BucketRef;
+	    enabled: boolean;
+	    lastRun?: string;
+	    lastStatus?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Job(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.stackPath = source["stackPath"];
+	        this.volumes = source["volumes"];
+	        this.databases = this.convertValues(source["databases"], DBTarget);
+	        this.includeCompose = source["includeCompose"];
+	        this.schedule = source["schedule"];
+	        this.retention = this.convertValues(source["retention"], RetentionPolicy);
+	        this.bucket = this.convertValues(source["bucket"], BucketRef);
+	        this.enabled = source["enabled"];
+	        this.lastRun = source["lastRun"];
+	        this.lastStatus = source["lastStatus"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class RestoreOptions {
+	    snapshotId: string;
+	    targetPath: string;
+	    restoreVolumes: boolean;
+	    restoreCompose: boolean;
+	    composeUp: boolean;
+	    importDatabases: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new RestoreOptions(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.snapshotId = source["snapshotId"];
+	        this.targetPath = source["targetPath"];
+	        this.restoreVolumes = source["restoreVolumes"];
+	        this.restoreCompose = source["restoreCompose"];
+	        this.composeUp = source["composeUp"];
+	        this.importDatabases = source["importDatabases"];
+	    }
+	}
+	
+	export class Secrets {
+	    accessKey: string;
+	    secretKey: string;
+	    resticPassword: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Secrets(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.accessKey = source["accessKey"];
+	        this.secretKey = source["secretKey"];
+	        this.resticPassword = source["resticPassword"];
+	    }
+	}
+	export class Snapshot {
+	    id: string;
+	    time: string;
+	    tags: string[];
+	    paths: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new Snapshot(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.time = source["time"];
+	        this.tags = source["tags"];
+	        this.paths = source["paths"];
+	    }
+	}
+
+}
+
 export namespace config {
 	
 	export class EnvVar {
@@ -225,6 +393,28 @@ export namespace docker {
 	        this.ports = source["ports"];
 	    }
 	}
+	export class TeardownOptions {
+	    path: string;
+	    project: string;
+	    composeFiles: string[];
+	    removeVolumes: boolean;
+	    removeImages: boolean;
+	    removeDir: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new TeardownOptions(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.path = source["path"];
+	        this.project = source["project"];
+	        this.composeFiles = source["composeFiles"];
+	        this.removeVolumes = source["removeVolumes"];
+	        this.removeImages = source["removeImages"];
+	        this.removeDir = source["removeDir"];
+	    }
+	}
 
 }
 
@@ -273,6 +463,20 @@ export namespace main {
 
 export namespace migration {
 	
+	export class ComposeContext {
+	    project: string;
+	    composeFiles: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new ComposeContext(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.project = source["project"];
+	        this.composeFiles = source["composeFiles"];
+	    }
+	}
 	export class Volume {
 	    name: string;
 	    size: number;
@@ -354,7 +558,8 @@ export namespace migration {
 	export class RunOptions {
 	    SourcePath: string;
 	    TargetPath: string;
-	    ComposeFile: string;
+	    ComposeFiles: string[];
+	    ProjectName: string;
 	    Volumes: string[];
 	    EnvFiles: string[];
 	    ExternalNetworks: string[];
@@ -368,7 +573,8 @@ export namespace migration {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.SourcePath = source["SourcePath"];
 	        this.TargetPath = source["TargetPath"];
-	        this.ComposeFile = source["ComposeFile"];
+	        this.ComposeFiles = source["ComposeFiles"];
+	        this.ProjectName = source["ProjectName"];
 	        this.Volumes = source["Volumes"];
 	        this.EnvFiles = source["EnvFiles"];
 	        this.ExternalNetworks = source["ExternalNetworks"];
@@ -376,6 +582,22 @@ export namespace migration {
 	    }
 	}
 	
+	export class SubStack {
+	    name: string;
+	    path: string;
+	    composeFile: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new SubStack(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.path = source["path"];
+	        this.composeFile = source["composeFile"];
+	    }
+	}
 
 }
 

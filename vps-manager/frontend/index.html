@@ -60,6 +60,8 @@
           <button data-tab="terminal" class="tab">Terminal</button>
           <button data-tab="deploy" class="tab">Deploy</button>
           <button data-tab="migration" class="tab">Migration</button>
+          <button data-tab="backups" class="tab">Backups</button>
+          <button data-tab="cleanup" class="tab">Cleanup</button>
         </nav>
 
         <!-- Files tab -->
@@ -194,6 +196,12 @@
               <label>Compose directory on source
                 <input type="text" id="mig-src-path" placeholder="/root/my-app" class="mono" />
               </label>
+              <label>Compose file <span class="muted">(optional — auto-detected, incl. from the running stack)</span>
+                <input type="text" id="mig-compose-file" placeholder="docker-compose.yml" class="mono" />
+              </label>
+              <label>Project name <span class="muted">(optional — auto-detected from the running stack)</span>
+                <input type="text" id="mig-project-name" placeholder="tradedesk-prod" class="mono" />
+              </label>
               <label>Target VPS
                 <select id="mig-dst"></select>
               </label>
@@ -215,6 +223,22 @@
               <p id="mig-setup-err" class="err-msg hidden"></p>
             </div>
 
+            <!-- Stage 1b: multi-stack folder — pick which sub-stacks to migrate -->
+            <div id="mig-substacks" class="mig-stage hidden">
+              <h3>Multiple stacks found</h3>
+              <p class="muted" style="font-size:13px;margin:0 0 12px;">
+                This folder has no compose file of its own, but its subdirectories do.
+                Pick which stacks to migrate — each goes to
+                <code><span id="mig-substack-target"></span>/&lt;name&gt;</code> on the target.
+              </p>
+              <div id="mig-substack-list" class="mig-summary" style="margin:0 0 12px;"></div>
+              <div class="modal-actions" style="margin-top:8px;">
+                <button id="mig-substack-back" class="btn btn-secondary">Back</button>
+                <button id="mig-substack-run" class="btn">Migrate selected</button>
+              </div>
+              <p id="mig-substack-err" class="err-msg hidden"></p>
+            </div>
+
             <!-- Stage 2: inventory + run -->
             <div id="mig-inventory" class="mig-stage hidden">
               <h3>Migration plan</h3>
@@ -231,7 +255,229 @@
               <pre id="mig-log" class="mig-log mono"></pre>
               <div id="mig-outcome" class="hidden"></div>
               <div class="modal-actions" style="margin-top:12px;">
+                <button id="mig-cleanup" class="btn btn-secondary hidden">Clean up source</button>
                 <button id="mig-reset" class="btn btn-secondary hidden">Start another</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Backups tab -->
+        <section id="tab-backups" class="tab-panel">
+          <div class="migration">
+            <!-- List of backup jobs configured on this VPS -->
+            <div id="backups-list-view" class="mig-stage">
+              <div class="deploy-toolbar">
+                <div>
+                  <h3 style="margin:0;font-size:15px;">Scheduled backups</h3>
+                  <p class="muted" style="font-size:12px;margin:2px 0 0;">
+                    Back up volumes, database dumps and compose files to an S3 bucket with
+                    <code>restic</code>, on a cron schedule that runs on the VPS itself.
+                  </p>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;">
+                  <label class="checkbox-row db-sudo-row" title="Run with sudo (needed to write /etc and use docker)">
+                    <input type="checkbox" id="backups-sudo" checked />
+                    <span>sudo</span>
+                  </label>
+                  <button id="backups-refresh" class="btn btn-secondary">Refresh</button>
+                  <button id="backups-add" class="btn">+ New backup</button>
+                </div>
+              </div>
+              <div id="backups-list" class="deploy-list"></div>
+            </div>
+
+            <!-- Create / edit a backup job -->
+            <div id="backups-form-view" class="mig-stage hidden">
+              <h3 id="backups-form-title">New backup</h3>
+              <label>Name<input type="text" id="bak-name" placeholder="batlaz nightly" /></label>
+              <label>Stack directory on the VPS
+                <input type="text" id="bak-path" placeholder="/opt/batlaz" class="mono" />
+              </label>
+              <div class="modal-actions" style="margin:0 0 8px;justify-content:flex-start;">
+                <button id="bak-detect" class="btn btn-secondary">Detect volumes &amp; databases</button>
+                <span id="bak-detect-note" class="muted" style="font-size:12px;"></span>
+              </div>
+              <div id="bak-volumes" class="mig-summary" style="margin:0 0 10px;"><span class="muted">No volumes detected yet.</span></div>
+              <div id="bak-databases" class="mig-summary" style="margin:0 0 10px;"><span class="muted">No databases detected yet.</span></div>
+              <label class="checkbox-row" style="margin-bottom:10px;">
+                <input type="checkbox" id="bak-compose" checked />
+                <span>Include compose file + .env (the whole stack directory)</span>
+              </label>
+
+              <h4 style="margin:10px 0 6px;">Schedule</h4>
+              <label>Cron expression
+                <input type="text" id="bak-schedule" class="mono" value="0 2 * * *" placeholder="0 2 * * *" />
+              </label>
+              <div class="modal-actions" style="margin:0 0 10px;justify-content:flex-start;gap:6px;">
+                <button class="btn btn-secondary bak-preset" data-cron="0 * * * *">Hourly</button>
+                <button class="btn btn-secondary bak-preset" data-cron="0 2 * * *">Daily 02:00</button>
+                <button class="btn btn-secondary bak-preset" data-cron="0 2 * * 0">Weekly Sun 02:00</button>
+                <button class="btn btn-secondary bak-preset" data-cron="0 2 1 * *">Monthly 1st 02:00</button>
+              </div>
+
+              <h4 style="margin:10px 0 6px;">Retention (restic forget)</h4>
+              <div class="row">
+                <label>Keep daily<input type="number" id="bak-keep-daily" value="7" min="0" /></label>
+                <label>Keep weekly<input type="number" id="bak-keep-weekly" value="4" min="0" /></label>
+                <label>Keep monthly<input type="number" id="bak-keep-monthly" value="6" min="0" /></label>
+              </div>
+
+              <h4 style="margin:10px 0 6px;">Destination bucket (S3-compatible)</h4>
+              <label>Provider
+                <select id="bak-provider">
+                  <option value="r2">Cloudflare R2</option>
+                  <option value="b2">Backblaze B2</option>
+                  <option value="aws">AWS S3</option>
+                  <option value="other">Other (S3-compatible)</option>
+                </select>
+              </label>
+              <p id="bak-provider-hint" class="muted" style="font-size:12px;margin:0 0 8px;"></p>
+              <label>Endpoint
+                <input type="text" id="bak-endpoint" class="mono" placeholder="s3.amazonaws.com  or  https://s3.us-west-002.backblazeb2.com" />
+              </label>
+              <div class="row">
+                <label>Bucket<input type="text" id="bak-bucket" class="mono" placeholder="my-backups" /></label>
+                <label>Region<input type="text" id="bak-region" class="mono" placeholder="us-east-1" /></label>
+              </div>
+              <label>Prefix (path within the bucket)
+                <input type="text" id="bak-prefix" class="mono" placeholder="batlaz" />
+              </label>
+              <div class="row">
+                <label>Access key ID<input type="text" id="bak-access" class="mono" autocomplete="off" /></label>
+                <label>Secret access key<input type="password" id="bak-secret" class="mono" autocomplete="off" /></label>
+              </div>
+              <label>Restic password (encrypts the repository)
+                <input type="password" id="bak-restic-pw" class="mono" autocomplete="off" />
+              </label>
+              <p class="warn" style="margin:6px 0 10px;">⚠ Record the restic password somewhere safe — without it the backups can't be restored.</p>
+              <label class="checkbox-row" style="margin-bottom:10px;">
+                <input type="checkbox" id="bak-enabled" checked />
+                <span>Enabled (write the cron schedule)</span>
+              </label>
+
+              <input type="hidden" id="bak-id" />
+              <div class="modal-actions" style="margin-top:8px;">
+                <button id="bak-cancel" class="btn btn-secondary">Cancel</button>
+                <button id="bak-save" class="btn">Test &amp; Save</button>
+              </div>
+              <p id="bak-form-err" class="err-msg hidden"></p>
+            </div>
+
+            <!-- Run-now live log -->
+            <div id="backups-run-view" class="mig-stage hidden">
+              <h3 id="backups-run-title">Backup running</h3>
+              <pre id="backups-log" class="mig-log mono"></pre>
+              <div id="backups-outcome" class="hidden"></div>
+              <div class="modal-actions" style="margin-top:12px;">
+                <button id="backups-run-back" class="btn btn-secondary hidden">Back to backups</button>
+              </div>
+            </div>
+
+            <!-- Snapshots browser -->
+            <div id="backups-snap-view" class="mig-stage hidden">
+              <div class="deploy-run-head">
+                <h3 id="backups-snap-title" style="margin:0;font-size:15px;">Snapshots</h3>
+                <button id="backups-snap-back" class="btn btn-secondary">Back to backups</button>
+              </div>
+              <div id="backups-snap-list" class="deploy-list"></div>
+            </div>
+
+            <!-- Restore a snapshot -->
+            <div id="backups-restore-view" class="mig-stage hidden">
+              <h3>Restore snapshot</h3>
+              <div id="bak-restore-meta" class="mig-summary" style="margin:0 0 10px;"></div>
+              <label>Target VPS
+                <select id="bak-restore-vps"></select>
+              </label>
+              <label>Target compose directory
+                <input type="text" id="bak-restore-path" class="mono" placeholder="/opt/batlaz" />
+              </label>
+              <label class="checkbox-row"><input type="checkbox" id="bak-restore-vols" checked /><span>Restore named volumes <span class="muted">— overwrites existing volume data</span></span></label>
+              <label class="checkbox-row"><input type="checkbox" id="bak-restore-compose" checked /><span>Restore compose files into the target directory</span></label>
+              <label class="checkbox-row"><input type="checkbox" id="bak-restore-up" checked /><span>Start the stack (<code>docker compose up -d</code>) after restoring</span></label>
+              <label class="checkbox-row" style="margin-bottom:8px;"><input type="checkbox" id="bak-restore-import" /><span>Import <code>.sql</code> dumps into running containers <span class="muted">— only for stacks without a DB volume</span></span></label>
+
+              <div id="bak-restore-creds" class="hidden">
+                <p class="muted" style="font-size:12px;margin:6px 0;">Restoring on a different VPS — it needs access to the same bucket:</p>
+                <div class="row">
+                  <label>Access key ID<input type="text" id="bak-restore-access" class="mono" autocomplete="off" /></label>
+                  <label>Secret access key<input type="password" id="bak-restore-secret" class="mono" autocomplete="off" /></label>
+                </div>
+                <label>Restic password<input type="password" id="bak-restore-pw" class="mono" autocomplete="off" /></label>
+              </div>
+
+              <label class="checkbox-row db-sudo-row" style="margin-top:4px;"><input type="checkbox" id="bak-restore-sudo" checked /><span>sudo</span></label>
+              <p class="warn" style="margin:8px 0;">⚠ Restoring overwrites existing volume data on the target — this can't be undone.</p>
+              <label class="checkbox-row" style="margin-bottom:8px;"><input type="checkbox" id="bak-restore-confirm" /><span>I understand this overwrites data on the target VPS.</span></label>
+              <div class="modal-actions">
+                <button id="bak-restore-cancel" class="btn btn-secondary">Cancel</button>
+                <button id="bak-restore-go" class="btn btn-danger" disabled>Restore</button>
+              </div>
+              <p id="bak-restore-err" class="err-msg hidden"></p>
+            </div>
+
+            <!-- Restore live log -->
+            <div id="backups-restore-run" class="mig-stage hidden">
+              <h3>Restore in progress</h3>
+              <pre id="bak-restore-log" class="mig-log mono"></pre>
+              <div id="bak-restore-outcome" class="hidden"></div>
+              <div class="modal-actions" style="margin-top:12px;">
+                <button id="bak-restore-runback" class="btn btn-secondary hidden">Back to backups</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Cleanup tab -->
+        <section id="tab-cleanup" class="tab-panel">
+          <div class="migration">
+            <!-- Stage 1: pick the stack -->
+            <div id="cleanup-setup" class="mig-stage">
+              <h3>Remove a stack</h3>
+              <p class="muted" style="font-size:13px;margin:0 0 16px;">
+                Tears down a docker-compose stack on this VPS: <code>docker compose down</code>,
+                and optionally its named volumes, images, and the stack directory. External
+                volumes and networks are left untouched.
+              </p>
+              <label>Compose directory
+                <input type="text" id="cleanup-path" placeholder="/opt/batlaz" class="mono" />
+              </label>
+              <label class="checkbox-row" style="margin-bottom:6px;">
+                <input type="checkbox" id="cleanup-sudo" checked />
+                <span>Use sudo</span>
+              </label>
+              <div class="modal-actions" style="margin-top:16px;">
+                <button id="cleanup-inspect" class="btn">Inspect stack</button>
+              </div>
+              <p id="cleanup-setup-err" class="err-msg hidden"></p>
+            </div>
+
+            <!-- Stage 2: review + confirm -->
+            <div id="cleanup-review" class="mig-stage hidden">
+              <h3>Confirm removal</h3>
+              <div id="cleanup-summary" class="mig-summary"></div>
+              <h4 style="margin:12px 0 6px;">What to remove</h4>
+              <label class="checkbox-row"><input type="checkbox" id="cleanup-vols" checked /><span>Named volumes (deletes the data)</span></label>
+              <label class="checkbox-row"><input type="checkbox" id="cleanup-images" /><span>Images used by the stack</span></label>
+              <label class="checkbox-row" style="margin-bottom:10px;"><input type="checkbox" id="cleanup-dir" checked /><span>The stack directory on disk</span></label>
+              <p class="warn" style="margin:0 0 10px;">⚠ This is irreversible. Type the stack folder name to confirm.</p>
+              <label>Type "<strong><span id="cleanup-confirm-name"></span></strong>" to confirm
+                <input type="text" id="cleanup-confirm" class="mono" autocomplete="off" />
+              </label>
+              <div class="modal-actions" style="margin-top:12px;">
+                <button id="cleanup-back" class="btn btn-secondary">Back</button>
+                <button id="cleanup-run" class="btn btn-danger" disabled>Remove stack</button>
+              </div>
+            </div>
+
+            <!-- Stage 3: live log -->
+            <div id="cleanup-run-view" class="mig-stage hidden">
+              <h3>Removing stack</h3>
+              <pre id="cleanup-log" class="mig-log mono"></pre>
+              <div id="cleanup-outcome" class="hidden"></div>
+              <div class="modal-actions" style="margin-top:12px;">
+                <button id="cleanup-reset" class="btn btn-secondary hidden">Done</button>
               </div>
             </div>
           </div>

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"vps-manager/internal/backup"
 	"vps-manager/internal/config"
 	"vps-manager/internal/db"
 	"vps-manager/internal/deploy"
@@ -851,10 +853,22 @@ func (a *App) FindComposeFile(id, dir string) (string, error) {
 // resolved inventory (services, volumes, env files, bind-mount warnings).
 // useSudo prefixes the docker commands with sudo for users whose docker
 // daemon isn't accessible without it.
-func (a *App) InspectMigration(id, sourcePath string, useSudo bool) (*migration.Inventory, error) {
-	ctx, cancel := context.WithTimeout(a.ctx, 60*time.Second)
+func (a *App) InspectMigration(id, sourcePath string, composeFiles []string, projectName string, useSudo bool) (*migration.Inventory, error) {
+	// 120s: inspect probes each service image's registry availability (docker
+	// manifest inspect) to decide which must be copied, which adds round-trips.
+	ctx, cancel := context.WithTimeout(a.ctx, 120*time.Second)
 	defer cancel()
-	return migration.Inspect(ctx, a.execFn(id, useSudo), sourcePath)
+	return migration.Inspect(ctx, a.execFn(id, useSudo), sourcePath, composeFiles, projectName)
+}
+
+// DiscoverComposeContext recovers the compose project name + file a running
+// stack actually uses (from its container labels), so the migration can drive
+// `docker compose` correctly when the file has a non-standard name or the
+// project name differs from the directory basename.
+func (a *App) DiscoverComposeContext(id, dir string, useSudo bool) migration.ComposeContext {
+	ctx, cancel := context.WithTimeout(a.ctx, 20*time.Second)
+	defer cancel()
+	return migration.DiscoverComposeContext(ctx, a.execFn(id, useSudo), dir)
 }
 
 // RunMigration starts the transfer in a goroutine, streaming each progress
@@ -883,6 +897,85 @@ func (a *App) RunMigration(srcID, dstID string, opts migration.RunOptions, useSu
 		msg := ""
 		if err != nil {
 			msg = err.Error()
+		}
+		wailsruntime.EventsEmit(a.ctx, "migration:done", msg)
+	}()
+	return nil
+}
+
+// DiscoverStacks scans the immediate subdirectories of a path for compose
+// stacks. The UI calls this when the path itself has no compose file (a
+// multi-stack parent folder) so the user can pick which sub-stacks to migrate.
+func (a *App) DiscoverStacks(id, dir string, useSudo bool) ([]migration.SubStack, error) {
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	return migration.DiscoverStacks(ctx, a.execFn(id, useSudo), dir)
+}
+
+// RunMultiMigration migrates several sub-stacks (subdirectories of sourceRoot)
+// in one run, each to <targetRoot>/<subdir>. It inspects and migrates them one
+// at a time, streaming through the same migration:log/done events, with a header
+// per stack and a summary of any failures at the end. A failing stack doesn't
+// stop the others.
+func (a *App) RunMultiMigration(srcID, dstID, sourceRoot, targetRoot string, subdirs []string, useSudo bool) error {
+	if isLocal(srcID) || isLocal(dstID) {
+		return fmt.Errorf("migration runs between two SSH servers; the local environment can't be a source or target")
+	}
+	src, err := a.pool.Get(srcID)
+	if err != nil {
+		return fmt.Errorf("source: %w", err)
+	}
+	dst, err := a.pool.Get(dstID)
+	if err != nil {
+		return fmt.Errorf("target: %w", err)
+	}
+	if len(subdirs) == 0 {
+		return fmt.Errorf("no sub-stacks selected")
+	}
+	srcExec := a.execFn(srcID, useSudo)
+	dstExec := a.execFn(dstID, useSudo)
+	srcRoot := strings.TrimRight(sourceRoot, "/")
+	tgtRoot := strings.TrimRight(targetRoot, "/")
+	go func() {
+		log := func(line string) { wailsruntime.EventsEmit(a.ctx, "migration:log", line) }
+		var failed []string
+		for i, sub := range subdirs {
+			log(fmt.Sprintf("\n══════════ Stack %d/%d: %s ══════════", i+1, len(subdirs), sub))
+			srcPath := srcRoot + "/" + sub
+			tgtPath := tgtRoot + "/" + sub
+			ictx, icancel := context.WithTimeout(a.ctx, 120*time.Second)
+			cc := migration.DiscoverComposeContext(ictx, srcExec, srcPath)
+			inv, err := migration.Inspect(ictx, srcExec, srcPath, cc.ComposeFiles, cc.Project)
+			icancel()
+			if err != nil {
+				log("✗ inspect failed: " + err.Error())
+				failed = append(failed, sub)
+				continue
+			}
+			vols := make([]string, 0, len(inv.Volumes))
+			for _, v := range inv.Volumes {
+				vols = append(vols, v.Name)
+			}
+			opts := migration.RunOptions{
+				SourcePath:       srcPath,
+				TargetPath:       tgtPath,
+				ComposeFiles:     cc.ComposeFiles,
+				ProjectName:      cc.Project,
+				Volumes:          vols,
+				EnvFiles:         inv.EnvFiles,
+				ExternalNetworks: inv.ExternalNetworks,
+				BuildImages:      inv.BuildImages,
+			}
+			if err := migration.Run(a.ctx, src, dst, srcExec, dstExec, opts, log); err != nil {
+				log("✗ " + sub + " failed: " + err.Error())
+				failed = append(failed, sub)
+				continue
+			}
+			log("✓ " + sub + " migrated")
+		}
+		msg := ""
+		if len(failed) > 0 {
+			msg = fmt.Sprintf("%d of %d stack(s) failed: %s", len(failed), len(subdirs), strings.Join(failed, ", "))
 		}
 		wailsruntime.EventsEmit(a.ctx, "migration:done", msg)
 	}()
@@ -1053,7 +1146,9 @@ func (a *App) DeleteDeployment(id string) error {
 // streamFn mirrors execFn for streaming commands, applying the same sudo
 // policy (skip for root, non-interactive `sudo -n` otherwise — failures
 // surface as-is, no password prompting).
-func (a *App) streamFn(id string, useSudo bool) deploy.StreamFn {
+// The unnamed return type is assignable to deploy.StreamFn, docker.StreamFn and
+// backup.StreamFn alike, so the same helper feeds all three packages.
+func (a *App) streamFn(id string, useSudo bool) func(context.Context, string, func(string)) (int, error) {
 	if isLocal(id) {
 		return func(ctx context.Context, cmd string, onOutput func(string)) (int, error) {
 			if a.local == nil {
@@ -1163,4 +1258,307 @@ func (a *App) RunContainerCommand(id, containerID, cmd string) (*CommandResult, 
 		Stderr:   res.Stderr,
 		ExitCode: res.ExitCode,
 	}, nil
+}
+
+// ensureConnected dials the VPS if it isn't already connected, so cleanup and
+// backup actions work straight after selecting a server.
+func (a *App) ensureConnected(id string) error {
+	if isLocal(id) {
+		return a.Connect(LocalID)
+	}
+	if _, ok := a.store.Get(id); !ok {
+		return fmt.Errorf("vps %s not found", id)
+	}
+	if !a.pool.IsConnected(id) {
+		return a.Connect(id)
+	}
+	return nil
+}
+
+// ───────── Cleanup / teardown ─────────
+//
+// Removes a docker-compose stack from a VPS: `docker compose down` (always),
+// optionally its named volumes and images, and optionally the stack directory.
+// External volumes/networks are left untouched by compose down. Progress streams
+// via "cleanup:log"/"cleanup:done", mirroring migration.
+
+// InspectTeardown previews what a stack contains (services, named volumes,
+// external networks) so the confirm screen can show exactly what will be removed.
+func (a *App) InspectTeardown(id, sourcePath string, composeFiles []string, projectName string, useSudo bool) (*migration.Inventory, error) {
+	ctx, cancel := context.WithTimeout(a.ctx, 90*time.Second)
+	defer cancel()
+	return migration.Inspect(ctx, a.execFn(id, useSudo), sourcePath, composeFiles, projectName)
+}
+
+// TeardownStack runs the teardown in a goroutine, streaming progress.
+func (a *App) TeardownStack(id string, opts docker.TeardownOptions, useSudo bool) error {
+	if err := a.ensureConnected(id); err != nil {
+		return err
+	}
+	exec := a.execFn(id, useSudo)
+	stream := a.streamFn(id, useSudo)
+	go func() {
+		log := func(line string) { wailsruntime.EventsEmit(a.ctx, "cleanup:log", line) }
+		err := func() error {
+			log("→ Stopping and removing stack at " + opts.Path + " …")
+			if opts.RemoveVolumes {
+				log("  named volumes WILL be removed")
+			} else {
+				log("  named volumes kept")
+			}
+			exit, err := docker.ComposeDown(a.ctx, stream, opts.Path, opts.Project, opts.ComposeFiles, opts.RemoveVolumes, opts.RemoveImages,
+				func(chunk string) { log(strings.TrimRight(chunk, "\n")) })
+			if err != nil {
+				return err
+			}
+			if exit != 0 {
+				return fmt.Errorf("docker compose down exited with code %d — see log above", exit)
+			}
+			if opts.RemoveDir {
+				log("→ Removing stack directory " + opts.Path + " …")
+				if err := docker.RemoveDir(a.ctx, exec, opts.Path); err != nil {
+					return err
+				}
+			}
+			log("✓ Cleanup complete.")
+			return nil
+		}()
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		wailsruntime.EventsEmit(a.ctx, "cleanup:done", msg)
+	}()
+	return nil
+}
+
+// ───────── Backups (restic, VPS-side cron) ─────────
+//
+// Backup jobs live on the VPS under /etc/vps-manager/backups + /etc/cron.d, so
+// they run on schedule even when this app is closed. These methods are a
+// management layer over those files. Backups require a remote VPS (restic + cron
+// don't apply to the local desktop), so each method rejects the local env.
+
+func (a *App) backupExec(id string, useSudo bool, d time.Duration) (backup.ExecFn, context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(a.ctx, d)
+	return a.execFn(id, useSudo), ctx, cancel
+}
+
+// secretWrite writes sensitive content (the bucket env: S3 keys + restic
+// password) to a root-owned path WITHOUT ever placing it on a command line. It
+// stages the bytes over the SFTP channel (so they never appear in `ps` or sudo's
+// syslog), then moves the file into place and fixes ownership/mode via the
+// (sudo'd) exec.
+func (a *App) secretWrite(id string, useSudo bool) backup.SecretWriteFn {
+	return func(ctx context.Context, p, content, mode string) error {
+		conn, err := a.pool.Get(id)
+		if err != nil {
+			return err
+		}
+		tmp := "/tmp/vpsm-" + backup.NewID() + ".tmp"
+		if err := sftp.WriteFile(conn.Client, tmp, content); err != nil {
+			return fmt.Errorf("stage secret: %w", err)
+		}
+		_ = sftp.Chmod(conn.Client, tmp, 0o600)
+		cleanup := func() { _, _ = a.execFn(id, false)(ctx, "rm -f "+shellQuote(tmp)) }
+		cmd := fmt.Sprintf("mkdir -p %s && mv %s %s && chown root:root %s && chmod %s %s",
+			shellQuote(path.Dir(p)), shellQuote(tmp), shellQuote(p), shellQuote(p), mode, shellQuote(p))
+		res, err := a.execFn(id, useSudo)(ctx, cmd)
+		if err != nil {
+			cleanup()
+			return err
+		}
+		if res.ExitCode != 0 {
+			cleanup()
+			msg := strings.TrimSpace(res.Stderr)
+			if msg == "" {
+				msg = fmt.Sprintf("exit %d", res.ExitCode)
+			}
+			return fmt.Errorf("install secret file: %s", msg)
+		}
+		return nil
+	}
+}
+
+// ListBackupJobs reads the backup jobs configured on the VPS.
+func (a *App) ListBackupJobs(id string, useSudo bool) ([]backup.Job, error) {
+	if isLocal(id) {
+		return nil, nil
+	}
+	if err := a.ensureConnected(id); err != nil {
+		return nil, err
+	}
+	exec, ctx, cancel := a.backupExec(id, useSudo, 30*time.Second)
+	defer cancel()
+	return backup.ListJobs(ctx, exec)
+}
+
+// SaveBackupJob installs restic if needed, writes the job's files + cron entry,
+// and ensures the restic repository exists. On edit, blank secrets are kept.
+func (a *App) SaveBackupJob(id string, job backup.Job, secrets backup.Secrets, useSudo bool) (backup.Job, error) {
+	if isLocal(id) {
+		return job, fmt.Errorf("backups run on a remote VPS, not the local environment")
+	}
+	if err := a.ensureConnected(id); err != nil {
+		return job, err
+	}
+	exec, ctx, cancel := a.backupExec(id, useSudo, 8*time.Minute) // a cold restic install downloads
+	defer cancel()
+	if _, err := backup.EnsureRestic(ctx, exec); err != nil {
+		return job, err
+	}
+	saved, err := backup.SaveJob(ctx, exec, a.secretWrite(id, useSudo), job, secrets)
+	if err != nil {
+		return job, err
+	}
+	if err := backup.InitRepo(ctx, exec, saved.ID); err != nil {
+		return saved, fmt.Errorf("repository init: %w", err)
+	}
+	return saved, nil
+}
+
+// DeleteBackupJob removes a job's files and cron entry (the bucket data is left
+// intact).
+func (a *App) DeleteBackupJob(id, jobID string, useSudo bool) error {
+	if err := a.ensureConnected(id); err != nil {
+		return err
+	}
+	exec, ctx, cancel := a.backupExec(id, useSudo, 30*time.Second)
+	defer cancel()
+	return backup.DeleteJob(ctx, exec, jobID)
+}
+
+// RunBackupNow triggers a job immediately, streaming output via
+// "backup:log:<jobID>" / "backup:done:<jobID>", and records the outcome.
+func (a *App) RunBackupNow(id, jobID string, useSudo bool) error {
+	if isLocal(id) {
+		return fmt.Errorf("backups run on a remote VPS, not the local environment")
+	}
+	if err := a.ensureConnected(id); err != nil {
+		return err
+	}
+	stream := a.streamFn(id, useSudo)
+	go func() {
+		log := func(line string) { wailsruntime.EventsEmit(a.ctx, "backup:log:"+jobID, line) }
+		exit, err := backup.RunNow(a.ctx, stream, jobID, func(chunk string) { log(strings.TrimRight(chunk, "\n")) })
+		status, msg := "success", ""
+		if err != nil {
+			status, msg = "failed", err.Error()
+		} else if exit != 0 {
+			status, msg = "failed", fmt.Sprintf("backup script exited with code %d — see log above", exit)
+		}
+		statusCtx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+		_ = backup.SetJobStatus(statusCtx, a.execFn(id, useSudo), jobID, time.Now().Format(time.RFC3339), status)
+		cancel()
+		wailsruntime.EventsEmit(a.ctx, "backup:done:"+jobID, msg)
+	}()
+	return nil
+}
+
+// ListBackupSnapshots lists the restic snapshots for a job (newest first).
+func (a *App) ListBackupSnapshots(id, jobID string, useSudo bool) ([]backup.Snapshot, error) {
+	if err := a.ensureConnected(id); err != nil {
+		return nil, err
+	}
+	exec, ctx, cancel := a.backupExec(id, useSudo, 90*time.Second)
+	defer cancel()
+	return backup.ListSnapshots(ctx, exec, jobID)
+}
+
+// ForgetBackupSnapshot deletes one snapshot from a job's repository and prunes.
+func (a *App) ForgetBackupSnapshot(id, jobID, snapshotID string, useSudo bool) error {
+	if err := a.ensureConnected(id); err != nil {
+		return err
+	}
+	exec, ctx, cancel := a.backupExec(id, useSudo, 5*time.Minute)
+	defer cancel()
+	return backup.ForgetSnapshot(ctx, exec, jobID, snapshotID)
+}
+
+// TestBackupTarget validates bucket credentials by initializing/opening the
+// restic repo with a throwaway env, after ensuring restic is installed.
+func (a *App) TestBackupTarget(id string, bucket backup.BucketRef, secrets backup.Secrets, useSudo bool) error {
+	if isLocal(id) {
+		return fmt.Errorf("backups run on a remote VPS, not the local environment")
+	}
+	if err := a.ensureConnected(id); err != nil {
+		return err
+	}
+	exec, ctx, cancel := a.backupExec(id, useSudo, 8*time.Minute)
+	defer cancel()
+	if _, err := backup.EnsureRestic(ctx, exec); err != nil {
+		return err
+	}
+	return backup.TestTarget(ctx, exec, a.secretWrite(id, useSudo), bucket, secrets)
+}
+
+// RestoreBackup restores a snapshot to targetVpsID (the job's own VPS or a
+// different one), streaming progress via "restore:log"/"restore:done". When
+// targetVpsID is the job's origin VPS, leave secrets blank to reuse the job's
+// stored credentials; for any other VPS, secrets (S3 keys + restic password)
+// must be supplied so the target can read the bucket. Restoring overwrites
+// existing volume data — the UI gates this behind a confirmation.
+func (a *App) RestoreBackup(targetVpsID string, job backup.Job, secrets backup.Secrets, opts backup.RestoreOptions, useSudo bool) error {
+	if isLocal(targetVpsID) {
+		return fmt.Errorf("restore runs on a remote VPS, not the local environment")
+	}
+	if opts.SnapshotID == "" {
+		return fmt.Errorf("no snapshot selected")
+	}
+	if err := a.ensureConnected(targetVpsID); err != nil {
+		return err
+	}
+	exec := a.execFn(targetVpsID, useSudo)
+	stream := a.streamFn(targetVpsID, useSudo)
+	hasSecrets := secrets.AccessKey != "" || secrets.SecretKey != "" || secrets.ResticPassword != ""
+	go func() {
+		log := func(line string) { wailsruntime.EventsEmit(a.ctx, "restore:log", line) }
+		err := func() error {
+			ctx, cancel := context.WithTimeout(a.ctx, 8*time.Minute)
+			defer cancel()
+			if _, err := backup.EnsureRestic(ctx, exec); err != nil {
+				return err
+			}
+			// Same VPS reuses the job's stored env; another VPS needs a temp one.
+			envPath := backup.JobEnvPath(job.ID)
+			cleanupEnv := false
+			if hasSecrets {
+				p, err := backup.WriteRestoreEnv(ctx, a.secretWrite(targetVpsID, useSudo), job.Bucket, secrets)
+				if err != nil {
+					return err
+				}
+				envPath = p
+				cleanupEnv = true
+				defer func() {
+					// Use a fresh context so app shutdown / cancellation can't skip
+					// removing the secret env (the script's trap also rm's it).
+					rmCtx, rmCancel := context.WithTimeout(context.Background(), 15*time.Second)
+					_, _ = exec(rmCtx, "rm -f "+shellQuote(p))
+					rmCancel()
+				}()
+			} else {
+				// Reusing the job's stored credentials — confirm they exist here.
+				if res, err := exec(ctx, "test -f "+shellQuote(envPath)); err != nil {
+					return err
+				} else if res.ExitCode != 0 {
+					return fmt.Errorf("this VPS has no stored credentials for backup job %s — enter the bucket access key, secret and restic password to restore here", job.ID)
+				}
+			}
+			script := backup.RenderRestoreScript(job, opts, envPath, cleanupEnv)
+			exit, serr := stream(a.ctx, script, func(chunk string) { log(strings.TrimRight(chunk, "\n")) })
+			if serr != nil {
+				return serr
+			}
+			if exit != 0 {
+				return fmt.Errorf("restore exited with code %d — see log above", exit)
+			}
+			return nil
+		}()
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		wailsruntime.EventsEmit(a.ctx, "restore:done", msg)
+	}()
+	return nil
 }

@@ -12,7 +12,7 @@ import {
   ListFiles, DownloadFile, UploadFile, DeleteRemoteFile, MakeDir, DefaultDownloadDir,
   StatRemoteFile, ChmodRemoteFile, ChownRemoteFile,
   SetSudoPassword, HasSudoPassword,
-  FindComposeFile, InspectMigration, RunMigration,
+  FindComposeFile, InspectMigration, RunMigration, DiscoverStacks, RunMultiMigration, DiscoverComposeContext,
   ReadRemoteFile, WriteRemoteFile,
   ListContainers, RestartContainer, StopContainer, StartContainer, ContainerLogs,
   StartShell, WriteShell, ResizeShell, CloseShell,
@@ -22,6 +22,9 @@ import {
   ListDeployments, SaveDeployment, DeleteDeployment, RunDeploy,
   LocalAvailable, LocalUnavailableReason, LocalStartDir,
   ListProjects, SaveProject, DeleteProject,
+  InspectTeardown, TeardownStack,
+  ListBackupJobs, SaveBackupJob, DeleteBackupJob, RunBackupNow,
+  ListBackupSnapshots, ForgetBackupSnapshot, TestBackupTarget, RestoreBackup,
 } from '../wailsjs/go/main/App'
 import { EventsOn } from '../wailsjs/runtime/runtime'
 
@@ -421,6 +424,14 @@ function loadCurrentTab() {
   }
   if (state.tab === 'db') {
     dbOpen()
+    return
+  }
+  if (state.tab === 'backups') {
+    backupsOpen()
+    return
+  }
+  if (state.tab === 'cleanup') {
+    cleanupOpen()
     return
   }
   if (!state.connected) return
@@ -1673,7 +1684,7 @@ const mig = {
 }
 
 function migShowStage(name) {
-  for (const id of ['mig-setup', 'mig-inventory', 'mig-run-view']) {
+  for (const id of ['mig-setup', 'mig-substacks', 'mig-inventory', 'mig-run-view']) {
     $(id).classList.toggle('hidden', id !== 'mig-' + name && id !== name)
   }
 }
@@ -1723,18 +1734,114 @@ async function migInspect() {
   btn.disabled = true
   btn.textContent = 'Inspecting…'
   try {
-    const composeFile = await FindComposeFile(srcId, srcPath)
-    const inv = await InspectMigration(srcId, srcPath, useSudo)
-    mig.inventory = inv
-    mig.composeFile = composeFile
-    mig.useSudo = useSudo
-    migRenderInventory(inv, srcPath, dstPath, composeFile)
-    migShowStage('inventory')
+    // Recover what the running stack actually uses (compose files + project name)
+    // from its container labels — handles non-standard filenames, override files,
+    // multi-`-f`, and custom -p.
+    let cc = null
+    try { cc = await DiscoverComposeContext(srcId, srcPath, useSudo) } catch { cc = null }
+    const manualFile = $('mig-compose-file').value.trim()
+    const projectName = $('mig-project-name').value.trim() || (cc && cc.project) || ''
+    // composeFiles: [] means "let compose auto-detect (keeps override merge)";
+    // a non-empty list forces exactly those -f files.
+    // Priority: manual field > running stack's files > [] (a standard file exists).
+    let composeFiles = null
+    if (manualFile) composeFiles = [manualFile]
+    else if (cc && cc.composeFiles && cc.composeFiles.length) composeFiles = cc.composeFiles
+    else {
+      let std = ''
+      try { std = await FindComposeFile(srcId, srcPath) } catch { std = '' }
+      if (std) composeFiles = [] // exists; auto-detect so default+override merge stays
+    }
+    if (composeFiles !== null) {
+      const inv = await InspectMigration(srcId, srcPath, composeFiles, projectName, useSudo)
+      mig.inventory = inv
+      mig.composeFiles = composeFiles
+      mig.projectName = projectName
+      mig.useSudo = useSudo
+      if (!$('mig-project-name').value.trim() && projectName) $('mig-project-name').value = projectName
+      migRenderInventory(inv, srcPath, dstPath, composeFiles.length ? composeFiles.join(', ') : '(auto-detected)')
+      migShowStage('inventory')
+      return
+    }
+    // No compose file here — maybe it's a parent folder of several stacks.
+    const subs = await DiscoverStacks(srcId, srcPath, useSudo) || []
+    if (subs.length) {
+      mig.useSudo = useSudo
+      migRenderSubstacks(subs, srcPath, dstPath)
+      migShowStage('substacks')
+      return
+    }
+    err(`No compose file in ${srcPath}, and no stacks found in its subdirectories.`)
   } catch (e) {
     err('Inspect failed: ' + errMsg(e))
   } finally {
     btn.disabled = false
     btn.textContent = 'Inspect stack'
+  }
+}
+
+function migRenderSubstacks(subs, srcRoot, dstRoot) {
+  mig.substacks = subs
+  mig.srcRoot = srcRoot
+  mig.dstRoot = dstRoot
+  $('mig-substack-target').textContent = dstRoot
+  $('mig-substack-err').classList.add('hidden')
+  $('mig-substack-list').innerHTML = subs.map((s) =>
+    `<label class="checkbox-row"><input type="checkbox" class="mig-sub" value="${htmlEsc(s.name)}" checked /><span><code>${htmlEsc(s.name)}</code> <span class="muted">— ${htmlEsc(s.composeFile)}</span></span></label>`
+  ).join('')
+}
+
+// Shared migration:log line handler — replaces an in-place progress line (zero-
+// width-space prefixed) instead of appending, matching the Go progress marker.
+const MIG_PROG = '​'
+function migAppendLog(line) {
+  const el = $('mig-log')
+  let txt = el.textContent
+  if (txt.endsWith('\n')) {
+    const body = txt.slice(0, -1)
+    const nl = body.lastIndexOf('\n')
+    if (body.slice(nl + 1).startsWith(MIG_PROG)) txt = txt.slice(0, nl + 1)
+  }
+  el.textContent = txt + line + '\n'
+  el.scrollTop = el.scrollHeight
+}
+
+async function migRunMulti() {
+  if (mig.running) return
+  const picked = Array.from(document.querySelectorAll('.mig-sub:checked')).map((c) => c.value)
+  if (!picked.length) {
+    const el = $('mig-substack-err'); el.textContent = 'Select at least one stack.'; el.classList.remove('hidden')
+    return
+  }
+  const srcId = $('mig-src').value
+  const dstId = $('mig-dst').value
+  mig.running = true
+  $('mig-outcome').classList.add('hidden')
+  $('mig-reset').classList.add('hidden')
+  $('mig-cleanup').classList.add('hidden')
+  migShowStage('run-view')
+  $('mig-log').textContent = mig.useSudo
+    ? '⚡ Sudo: ON — remote commands prefixed with sudo on both VPSes.\n\n'
+    : '⚡ Sudo: off — running as the SSH user on both VPSes.\n\n'
+  mig.logOff = EventsOn('migration:log', migAppendLog)
+  mig.doneOff = EventsOn('migration:done', (errStr) => {
+    mig.running = false
+    const out = $('mig-outcome')
+    if (errStr) { out.textContent = '✗ ' + errStr; out.className = 'err' }
+    else { out.textContent = '✓ All selected stacks migrated. Verify the target before shutting down source.'; out.className = 'ok' }
+    out.classList.remove('hidden')
+    $('mig-reset').classList.remove('hidden')
+    if (mig.logOff) { mig.logOff(); mig.logOff = null }
+    if (mig.doneOff) { mig.doneOff(); mig.doneOff = null }
+  })
+  try {
+    await RunMultiMigration(srcId, dstId, mig.srcRoot, mig.dstRoot, picked, mig.useSudo)
+  } catch (e) {
+    mig.running = false
+    const out = $('mig-outcome'); out.textContent = '✗ Failed to start: ' + errMsg(e); out.className = 'err'
+    out.classList.remove('hidden'); $('mig-reset').classList.remove('hidden')
+    if (mig.logOff) { mig.logOff(); mig.logOff = null }
+    if (mig.doneOff) { mig.doneOff(); mig.doneOff = null }
   }
 }
 
@@ -1787,9 +1894,9 @@ function migRenderInventory(inv, srcPath, dstPath, composeFile) {
   }
 
   if ((inv.buildImages || []).length) {
-    sections.push(`<h4>Built images (${inv.buildImages.length})</h4>`)
+    sections.push(`<h4>Images copied from source (${inv.buildImages.length})</h4>`)
     sections.push('<ul>' + inv.buildImages.map((n) =>
-      `<li><code>${n}</code> <span class="muted">— shipped prebuilt (save/load), no rebuild on target</span></li>`
+      `<li><code>${n}</code> <span class="muted">— not in a registry; shipped via docker save/load so the target needn't pull or build it</span></li>`
     ).join('') + '</ul>')
   }
 
@@ -1811,7 +1918,8 @@ async function migRun() {
   const opts = {
     sourcePath: $('mig-src-path').value.trim(),
     targetPath: $('mig-dst-path').value.trim(),
-    composeFile: mig.composeFile,
+    composeFiles: mig.composeFiles || [],
+    projectName: mig.projectName || '',
     volumes: (mig.inventory.volumes || []).map((v) => v.name),
     envFiles: mig.inventory.envFiles || [],
     externalNetworks: mig.inventory.externalNetworks || [],
@@ -1822,6 +1930,7 @@ async function migRun() {
   $('mig-log').textContent = ''
   $('mig-outcome').classList.add('hidden')
   $('mig-reset').classList.add('hidden')
+  $('mig-cleanup').classList.add('hidden')
   migShowStage('run-view')
   // First log line tells the user, in writing, whether sudo is actually in
   // effect for this run — so a forgotten checkbox can't quietly cause the
@@ -1831,24 +1940,9 @@ async function migRun() {
     ? '⚡ Sudo: ON — remote commands prefixed with sudo on both VPSes.\n\n'
     : '⚡ Sudo: off — running as the SSH user on both VPSes.\n\n'
 
-  // Subscribe before kicking off so early lines aren't missed.
-  // Lines prefixed with a zero-width space are in-place progress updates: they
-  // replace the previous progress line instead of appending, so a transfer
-  // counter ticks in place (terminal-style) rather than flooding the log.
-  const PROG_MARK = '​'
-  mig.logOff = EventsOn('migration:log', (line) => {
-    const el = $('mig-log')
-    let txt = el.textContent
-    if (txt.endsWith('\n')) {
-      const body = txt.slice(0, -1)
-      const nl = body.lastIndexOf('\n')
-      if (body.slice(nl + 1).startsWith(PROG_MARK)) {
-        txt = txt.slice(0, nl + 1) // drop the prior progress line
-      }
-    }
-    el.textContent = txt + line + '\n'
-    el.scrollTop = el.scrollHeight
-  })
+  // Subscribe before kicking off so early lines aren't missed. migAppendLog
+  // handles in-place progress lines (zero-width-space prefixed).
+  mig.logOff = EventsOn('migration:log', migAppendLog)
   mig.doneOff = EventsOn('migration:done', (errStr) => {
     mig.running = false
     const out = $('mig-outcome')
@@ -1858,6 +1952,8 @@ async function migRun() {
     } else {
       out.textContent = '✓ Migration completed. Verify the target before shutting down source.'
       out.className = 'ok'
+      // Offer a shortcut to tear the source stack down once verified.
+      $('mig-cleanup').classList.remove('hidden')
     }
     out.classList.remove('hidden')
     $('mig-reset').classList.remove('hidden')
@@ -1878,6 +1974,469 @@ async function migRun() {
     if (mig.logOff) { mig.logOff(); mig.logOff = null }
     if (mig.doneOff) { mig.doneOff(); mig.doneOff = null }
   }
+}
+
+// ─────────── Cleanup / teardown ───────────
+const cleanup = { inventory: null, running: false, logOff: null, doneOff: null, project: '', composeFiles: [] }
+
+const htmlEsc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
+
+function cleanupShowStage(name) {
+  for (const id of ['cleanup-setup', 'cleanup-review', 'cleanup-run-view']) {
+    $(id).classList.toggle('hidden', id !== 'cleanup-' + name && id !== name)
+  }
+}
+
+function cleanupOpen() {
+  const err = $('cleanup-setup-err')
+  err.classList.add('hidden')
+  if (isLocalSel()) {
+    cleanupShowStage('setup')
+    err.textContent = 'Cleanup runs on a remote VPS.'
+    err.classList.remove('hidden')
+    return
+  }
+  cleanupShowStage('setup')
+  if (state.projectPath && !$('cleanup-path').value) $('cleanup-path').value = state.projectPath
+}
+
+async function cleanupInspect() {
+  const path = $('cleanup-path').value.trim()
+  const useSudo = $('cleanup-sudo').checked
+  const fail = (m) => { const el = $('cleanup-setup-err'); el.textContent = m; el.classList.remove('hidden') }
+  if (isLocalSel()) return fail('Cleanup runs on a remote VPS.')
+  if (!state.selectedId) return fail('Select a VPS first.')
+  if (!path) return fail('Enter the compose directory.')
+  $('cleanup-setup-err').classList.add('hidden')
+  const btn = $('cleanup-inspect'); btn.disabled = true; btn.textContent = 'Inspecting…'
+  try {
+    // Recover the real project/compose files so `down` targets the right project.
+    let cc = null
+    try { cc = await DiscoverComposeContext(state.selectedId, path, useSudo) } catch { cc = null }
+    cleanup.project = (cc && cc.project) || ''
+    cleanup.composeFiles = (cc && cc.composeFiles) || []
+    const inv = await InspectTeardown(state.selectedId, path, cleanup.composeFiles, cleanup.project, useSudo)
+    cleanup.inventory = inv
+    cleanupRenderReview(inv, path)
+    cleanupShowStage('review')
+  } catch (e) {
+    fail('Inspect failed: ' + errMsg(e))
+  } finally {
+    btn.disabled = false; btn.textContent = 'Inspect stack'
+  }
+}
+
+function cleanupRenderReview(inv, path) {
+  const base = path.replace(/\/+$/, '').split('/').pop() || path
+  $('cleanup-confirm-name').textContent = base
+  $('cleanup-confirm').value = ''
+  $('cleanup-run').disabled = true
+  const sec = []
+  sec.push(`<h4>Stack</h4><div class="mono" style="font-size:12px;"><code>${htmlEsc(path)}</code></div>`)
+  sec.push(`<h4>Services (${(inv.services || []).length})</h4>`)
+  if ((inv.services || []).length) {
+    sec.push('<ul>' + inv.services.map((s) => `<li><strong>${htmlEsc(s.name)}</strong> — <code>${htmlEsc(s.image || '(built)')}</code></li>`).join('') + '</ul>')
+  } else sec.push('<div class="muted">none</div>')
+  sec.push(`<h4>Named volumes (${(inv.volumes || []).length})</h4>`)
+  if ((inv.volumes || []).length) {
+    sec.push('<ul>' + inv.volumes.map((v) => `<li><code>${htmlEsc(v.name)}</code></li>`).join('') + '</ul>')
+  } else sec.push('<div class="muted">none</div>')
+  if ((inv.externalNetworks || []).length) {
+    sec.push('<h4>External networks (left untouched)</h4>')
+    sec.push('<ul>' + inv.externalNetworks.map((n) => `<li><code>${htmlEsc(n)}</code></li>`).join('') + '</ul>')
+  }
+  $('cleanup-summary').innerHTML = sec.join('')
+}
+
+async function cleanupRun() {
+  if (cleanup.running) return
+  const opts = {
+    path: $('cleanup-path').value.trim(),
+    project: cleanup.project || '',
+    composeFiles: cleanup.composeFiles || [],
+    removeVolumes: $('cleanup-vols').checked,
+    removeImages: $('cleanup-images').checked,
+    removeDir: $('cleanup-dir').checked,
+  }
+  cleanup.running = true
+  $('cleanup-log').textContent = ''
+  $('cleanup-outcome').classList.add('hidden')
+  $('cleanup-reset').classList.add('hidden')
+  cleanupShowStage('run-view')
+  cleanup.logOff = EventsOn('cleanup:log', (line) => {
+    const el = $('cleanup-log'); el.textContent += line + '\n'; el.scrollTop = el.scrollHeight
+  })
+  cleanup.doneOff = EventsOn('cleanup:done', (errStr) => {
+    cleanup.running = false
+    const out = $('cleanup-outcome')
+    if (errStr) { out.textContent = '✗ Cleanup failed: ' + errStr; out.className = 'err' }
+    else { out.textContent = '✓ Stack removed.'; out.className = 'ok' }
+    out.classList.remove('hidden')
+    $('cleanup-reset').classList.remove('hidden')
+    if (cleanup.logOff) { cleanup.logOff(); cleanup.logOff = null }
+    if (cleanup.doneOff) { cleanup.doneOff(); cleanup.doneOff = null }
+  })
+  try {
+    await TeardownStack(state.selectedId, opts, $('cleanup-sudo').checked)
+  } catch (e) {
+    cleanup.running = false
+    const out = $('cleanup-outcome'); out.textContent = '✗ Failed to start: ' + errMsg(e); out.className = 'err'
+    out.classList.remove('hidden'); $('cleanup-reset').classList.remove('hidden')
+    if (cleanup.logOff) { cleanup.logOff(); cleanup.logOff = null }
+    if (cleanup.doneOff) { cleanup.doneOff(); cleanup.doneOff = null }
+  }
+}
+
+// ─────────── Backups ───────────
+const bak = { jobs: [], editing: null, dbItems: [], runOff: null, doneOff: null }
+
+function bakShowView(name) {
+  const ids = ['backups-list-view', 'backups-form-view', 'backups-run-view', 'backups-snap-view',
+    'backups-restore-view', 'backups-restore-run']
+  for (const id of ids) {
+    $(id).classList.toggle('hidden', id !== 'backups-' + name && id !== name)
+  }
+}
+const bakSudo = () => $('backups-sudo').checked
+
+async function backupsOpen() {
+  bakShowView('list-view')
+  await backupsRefresh()
+}
+
+async function backupsRefresh() {
+  const list = $('backups-list')
+  if (isLocalSel()) { list.innerHTML = '<p class="muted center-msg">Backups run on a remote VPS.</p>'; return }
+  if (!state.selectedId) { list.innerHTML = '<p class="muted center-msg">Select a VPS.</p>'; return }
+  list.innerHTML = '<p class="muted center-msg">Loading…</p>'
+  try {
+    bak.jobs = await ListBackupJobs(state.selectedId, bakSudo()) || []
+    backupsRenderList()
+  } catch (e) {
+    list.innerHTML = `<p class="muted center-msg">Error: ${htmlEsc(errMsg(e))}</p>`
+  }
+}
+
+function backupsRenderList() {
+  const list = $('backups-list')
+  if (!bak.jobs.length) {
+    list.innerHTML = '<p class="muted center-msg">No backup jobs on this VPS yet. Create one with “+ New backup”.</p>'
+    return
+  }
+  list.innerHTML = bak.jobs.map((j) => {
+    const when = j.lastRun ? ' · ' + new Date(j.lastRun).toLocaleString() : ''
+    const status = j.lastStatus ? `<span class="state">${htmlEsc(j.lastStatus)}${htmlEsc(when)}</span>` : ''
+    const dest = `${j.bucket?.bucket || '?'}${j.bucket?.prefix ? '/' + j.bucket.prefix : ''}`
+    const dis = j.enabled ? '' : ' <span class="muted">(disabled)</span>'
+    return `<div class="container-row">
+      <div class="info">
+        <div class="name-line"><span class="name">${htmlEsc(j.name)}</span>${status}</div>
+        <div class="meta mono">${htmlEsc(j.schedule)} · ${htmlEsc(dest)}${dis}</div>
+      </div>
+      <div class="actions">
+        <button data-act="run" data-id="${j.id}" class="btn btn-secondary">Run now</button>
+        <button data-act="snap" data-id="${j.id}" class="btn btn-secondary">Snapshots</button>
+        <button data-act="edit" data-id="${j.id}" class="btn btn-secondary">Edit</button>
+        <button data-act="del" data-id="${j.id}" class="btn btn-danger">Delete</button>
+      </div>
+    </div>`
+  }).join('')
+  list.querySelectorAll('button[data-act]').forEach((b) =>
+    b.addEventListener('click', () => bakAction(b.dataset.act, b.dataset.id)))
+}
+
+function bakAction(act, id) {
+  const job = bak.jobs.find((j) => j.id === id)
+  if (act === 'run') return bakRunNow(id, job)
+  if (act === 'snap') return bakSnapshots(id, job)
+  if (act === 'edit') return bakOpenForm(job)
+  if (act === 'del') return bakDelete(id, job)
+}
+
+function bakOpenForm(job) {
+  bak.editing = job || null
+  $('backups-form-title').textContent = job ? 'Edit backup' : 'New backup'
+  $('bak-id').value = job?.id || ''
+  $('bak-name').value = job?.name || ''
+  $('bak-path').value = job?.stackPath || state.projectPath || ''
+  $('bak-compose').checked = job ? !!job.includeCompose : true
+  $('bak-schedule').value = job?.schedule || '0 2 * * *'
+  $('bak-keep-daily').value = job?.retention?.keepDaily ?? 7
+  $('bak-keep-weekly').value = job?.retention?.keepWeekly ?? 4
+  $('bak-keep-monthly').value = job?.retention?.keepMonthly ?? 6
+  $('bak-endpoint').value = job?.bucket?.endpoint || ''
+  $('bak-bucket').value = job?.bucket?.bucket || ''
+  $('bak-region').value = job?.bucket?.region || ''
+  $('bak-prefix').value = job?.bucket?.prefix || ''
+  const keepHint = job ? 'leave blank to keep' : ''
+  for (const f of ['bak-access', 'bak-secret', 'bak-restic-pw']) { $(f).value = ''; $(f).placeholder = keepHint }
+  $('bak-enabled').checked = job ? !!job.enabled : true
+  $('bak-form-err').classList.add('hidden')
+  $('bak-detect-note').textContent = ''
+  bakRenderVolumes((job?.volumes || []).map((v) => ({ name: v, checked: true })))
+  bakRenderDatabases((job?.databases || []).map((d) => ({ ...d, checked: true })))
+  const prov = bakProviderFromEndpoint(job?.bucket?.endpoint)
+  $('bak-provider').value = prov
+  bakApplyProvider(prov)
+  bakShowView('form-view')
+}
+
+// bakProviderFromEndpoint guesses the provider for the preset dropdown. New jobs
+// (no endpoint) default to R2 since that's the most-asked target.
+function bakProviderFromEndpoint(ep) {
+  const e = (ep || '').toLowerCase()
+  if (e.includes('r2.cloudflarestorage.com')) return 'r2'
+  if (e.includes('backblazeb2.com')) return 'b2'
+  if (e.includes('amazonaws.com')) return 'aws'
+  return e ? 'other' : 'r2'
+}
+
+// bakApplyProvider prefills the endpoint/region hints for the chosen provider so
+// each one works out of the box — notably Cloudflare R2 (region "auto", which
+// restic needs and most people don't know).
+function bakApplyProvider(p) {
+  const ep = $('bak-endpoint'); const region = $('bak-region'); const hint = $('bak-provider-hint')
+  if (p === 'r2') {
+    ep.placeholder = 'https://<ACCOUNT_ID>.r2.cloudflarestorage.com'
+    if (!region.value || region.value === 'us-east-1' || region.value === 'us-west-002') region.value = 'auto'
+    hint.innerHTML = 'Create an <strong>R2 API token</strong> (Cloudflare → R2 → Manage API Tokens → <em>Object Read &amp; Write</em>) and use its Access Key ID + Secret below. The endpoint is your account’s S3 URL; region is <code>auto</code>.'
+  } else if (p === 'b2') {
+    ep.placeholder = 's3.us-west-002.backblazeb2.com'
+    if (region.value === 'auto') region.value = ''
+    region.placeholder = 'us-west-002'
+    hint.textContent = 'Use a Backblaze application key (keyID + applicationKey). The region matches your endpoint, e.g. us-west-002.'
+  } else if (p === 'aws') {
+    ep.placeholder = 's3.amazonaws.com'
+    if (region.value === 'auto') region.value = ''
+    region.placeholder = 'us-east-1'
+    hint.textContent = 'Use an IAM access key with read/write on the bucket. Set the bucket’s region.'
+  } else {
+    ep.placeholder = 'https://s3.example.com'
+    hint.textContent = 'Any S3-compatible endpoint — include https:// in the endpoint URL.'
+  }
+}
+
+function bakRenderVolumes(items) {
+  const el = $('bak-volumes')
+  if (!items.length) { el.innerHTML = '<span class="muted">No volumes detected. Enter the stack dir and click Detect.</span>'; return }
+  el.innerHTML = '<h4 style="margin:0 0 6px;">Volumes</h4>' + items.map((v) =>
+    `<label class="checkbox-row"><input type="checkbox" class="bak-vol" value="${htmlEsc(v.name)}" ${v.checked !== false ? 'checked' : ''}/><span><code>${htmlEsc(v.name)}</code></span></label>`
+  ).join('')
+}
+
+function bakRenderDatabases(items) {
+  bak.dbItems = items
+  const el = $('bak-databases')
+  if (!items.length) { el.innerHTML = '<span class="muted">No databases detected.</span>'; return }
+  el.innerHTML = '<h4 style="margin:0 0 6px;">Databases</h4>' + items.map((d, i) =>
+    `<label class="checkbox-row"><input type="checkbox" class="bak-db" data-i="${i}" ${d.checked !== false ? 'checked' : ''}/><span><code>${htmlEsc(d.container)}</code> · ${htmlEsc(d.engine)} · db <code>${htmlEsc(d.db || '?')}</code></span></label>`
+  ).join('')
+}
+
+async function bakDetect() {
+  const path = $('bak-path').value.trim()
+  if (!state.selectedId || !path) { $('bak-detect-note').textContent = 'Enter the stack directory first.'; return }
+  const btn = $('bak-detect'); btn.disabled = true; btn.textContent = 'Detecting…'
+  try {
+    const inv = await InspectTeardown(state.selectedId, path, bakSudo())
+    bakRenderVolumes((inv.volumes || []).map((v) => ({ name: v.name, checked: true })))
+    const dbc = await ListDBContainers(state.selectedId, bakSudo(), path) || []
+    bakRenderDatabases(dbc.map((c) => ({ container: c.name, engine: c.engine, user: c.user, db: c.defaultDb, checked: true })))
+    $('bak-detect-note').textContent = `${(inv.volumes || []).length} volume(s), ${dbc.length} database(s)`
+  } catch (e) {
+    $('bak-detect-note').textContent = 'Detect failed: ' + errMsg(e)
+  } finally {
+    btn.disabled = false; btn.textContent = 'Detect volumes & databases'
+  }
+}
+
+async function bakSave() {
+  const fail = (m) => { const el = $('bak-form-err'); el.textContent = m; el.classList.remove('hidden') }
+  const name = $('bak-name').value.trim()
+  const path = $('bak-path').value.trim()
+  const endpoint = $('bak-endpoint').value.trim()
+  const bucket = $('bak-bucket').value.trim()
+  if (!name) return fail('Enter a name.')
+  if (!path) return fail('Enter the stack directory.')
+  if (!endpoint || !bucket) return fail('Enter the bucket endpoint and name.')
+  const volumes = Array.from(document.querySelectorAll('.bak-vol:checked')).map((c) => c.value)
+  const databases = Array.from(document.querySelectorAll('.bak-db:checked'))
+    .map((c) => bak.dbItems[parseInt(c.dataset.i, 10)]).filter(Boolean)
+    .map((d) => ({ container: d.container, engine: d.engine, user: d.user, db: d.db }))
+  const job = {
+    id: $('bak-id').value || '',
+    name, stackPath: path, volumes, databases,
+    includeCompose: $('bak-compose').checked,
+    schedule: $('bak-schedule').value.trim(),
+    retention: {
+      keepDaily: parseInt($('bak-keep-daily').value || '0', 10),
+      keepWeekly: parseInt($('bak-keep-weekly').value || '0', 10),
+      keepMonthly: parseInt($('bak-keep-monthly').value || '0', 10),
+      keepLast: 0,
+    },
+    bucket: { endpoint, region: $('bak-region').value.trim(), bucket, prefix: $('bak-prefix').value.trim() },
+    enabled: $('bak-enabled').checked,
+  }
+  const secrets = {
+    accessKey: $('bak-access').value,
+    secretKey: $('bak-secret').value,
+    resticPassword: $('bak-restic-pw').value,
+  }
+  const hasSecret = secrets.accessKey || secrets.secretKey || secrets.resticPassword
+  if (!bak.editing && (!secrets.accessKey || !secrets.secretKey || !secrets.resticPassword)) {
+    return fail('Enter the access key, secret key and restic password.')
+  }
+  $('bak-form-err').classList.add('hidden')
+  const btn = $('bak-save'); btn.disabled = true; btn.textContent = 'Testing & saving…'
+  try {
+    if (!bak.editing || hasSecret) {
+      await TestBackupTarget(state.selectedId, job.bucket, secrets, bakSudo())
+    }
+    await SaveBackupJob(state.selectedId, job, secrets, bakSudo())
+    bakShowView('list-view')
+    await backupsRefresh()
+  } catch (e) {
+    fail('Save failed: ' + errMsg(e))
+  } finally {
+    btn.disabled = false; btn.textContent = 'Test & Save'
+  }
+}
+
+function bakRunNow(id, job) {
+  $('backups-run-title').textContent = 'Backing up: ' + (job?.name || id)
+  $('backups-log').textContent = ''
+  $('backups-outcome').classList.add('hidden')
+  $('backups-run-back').classList.add('hidden')
+  bakShowView('run-view')
+  const finish = (out, cls) => {
+    const o = $('backups-outcome'); o.textContent = out; o.className = cls
+    o.classList.remove('hidden'); $('backups-run-back').classList.remove('hidden')
+    if (bak.runOff) { bak.runOff(); bak.runOff = null }
+    if (bak.doneOff) { bak.doneOff(); bak.doneOff = null }
+  }
+  bak.runOff = EventsOn('backup:log:' + id, (line) => {
+    const el = $('backups-log'); el.textContent += line + '\n'; el.scrollTop = el.scrollHeight
+  })
+  bak.doneOff = EventsOn('backup:done:' + id, (errStr) => {
+    if (errStr) finish('✗ Backup failed: ' + errStr, 'err')
+    else { finish('✓ Backup complete.', 'ok'); backupsRefresh() }
+  })
+  RunBackupNow(state.selectedId, id, bakSudo()).catch((e) => finish('✗ Failed to start: ' + errMsg(e), 'err'))
+}
+
+async function bakSnapshots(id, job) {
+  $('backups-snap-title').textContent = 'Snapshots: ' + (job?.name || id)
+  const list = $('backups-snap-list')
+  list.innerHTML = '<p class="muted center-msg">Loading…</p>'
+  bakShowView('snap-view')
+  try {
+    const snaps = await ListBackupSnapshots(state.selectedId, id, bakSudo()) || []
+    if (!snaps.length) { list.innerHTML = '<p class="muted center-msg">No snapshots yet.</p>'; return }
+    list.innerHTML = snaps.map((s) => `<div class="container-row">
+      <div class="info">
+        <div class="name-line"><span class="name mono">${htmlEsc(s.id)}</span><span class="state">${htmlEsc(new Date(s.time).toLocaleString())}</span></div>
+        <div class="meta mono">${htmlEsc((s.paths || []).join(', '))}</div>
+      </div>
+      <div class="actions">
+        <button data-restore="${htmlEsc(s.id)}" class="btn btn-secondary">Restore</button>
+        <button data-snap="${htmlEsc(s.id)}" class="btn btn-danger">Delete</button>
+      </div>
+    </div>`).join('')
+    list.querySelectorAll('button[data-restore]').forEach((b) => b.addEventListener('click', () => bakOpenRestore(job, b.dataset.restore)))
+    list.querySelectorAll('button[data-snap]').forEach((b) => b.addEventListener('click', () => bakForget(id, b.dataset.snap)))
+  } catch (e) {
+    list.innerHTML = `<p class="muted center-msg">Error: ${htmlEsc(errMsg(e))}</p>`
+  }
+}
+
+async function bakForget(jobId, snapId) {
+  if (!confirm('Delete snapshot ' + snapId + '? This prunes it from the bucket.')) return
+  try {
+    await ForgetBackupSnapshot(state.selectedId, jobId, snapId, bakSudo())
+    bakSnapshots(jobId, bak.jobs.find((j) => j.id === jobId))
+  } catch (e) { alert('Delete failed: ' + errMsg(e)) }
+}
+
+async function bakDelete(id, job) {
+  if (!confirm(`Delete backup job "${job?.name || id}"? The cron schedule and config are removed; the bucket data is kept.`)) return
+  try { await DeleteBackupJob(state.selectedId, id, bakSudo()); await backupsRefresh() }
+  catch (e) { alert('Delete failed: ' + errMsg(e)) }
+}
+
+// ─────────── Restore ───────────
+function bakOpenRestore(job, snapId) {
+  bak.restoreJob = job
+  bak.restoreSnap = snapId
+  $('bak-restore-meta').innerHTML =
+    `<div>Snapshot <code class="mono">${htmlEsc(snapId)}</code> of <strong>${htmlEsc(job.name)}</strong></div>` +
+    `<div class="muted" style="font-size:12px;">bucket <code>${htmlEsc(job.bucket?.bucket || '')}${job.bucket?.prefix ? '/' + htmlEsc(job.bucket.prefix) : ''}</code></div>`
+  const sel = $('bak-restore-vps')
+  sel.innerHTML = state.vpses.filter((v) => !v.isLocal)
+    .map((v) => `<option value="${v.id}">${htmlEsc(v.name)} (${htmlEsc(v.user)}@${htmlEsc(v.host)})</option>`).join('')
+  sel.value = state.selectedId
+  $('bak-restore-path').value = job.stackPath || ''
+  $('bak-restore-vols').checked = true
+  $('bak-restore-compose').checked = true
+  $('bak-restore-up').checked = true
+  $('bak-restore-import').checked = false
+  for (const f of ['bak-restore-access', 'bak-restore-secret', 'bak-restore-pw']) $(f).value = ''
+  $('bak-restore-sudo').checked = bakSudo()
+  $('bak-restore-confirm').checked = false
+  $('bak-restore-go').disabled = true
+  $('bak-restore-err').classList.add('hidden')
+  bakRestoreToggleCreds()
+  bakShowView('restore-view')
+}
+
+// The origin VPS (the one whose backups we're viewing) already stores the
+// credentials, so they're only needed when restoring somewhere else.
+function bakRestoreToggleCreds() {
+  $('bak-restore-creds').classList.toggle('hidden', $('bak-restore-vps').value === state.selectedId)
+}
+
+async function bakDoRestore() {
+  const job = bak.restoreJob
+  const targetVps = $('bak-restore-vps').value
+  const sameVps = targetVps === state.selectedId
+  const fail = (m) => { const el = $('bak-restore-err'); el.textContent = m; el.classList.remove('hidden') }
+  const opts = {
+    snapshotId: bak.restoreSnap,
+    targetPath: $('bak-restore-path').value.trim(),
+    restoreVolumes: $('bak-restore-vols').checked,
+    restoreCompose: $('bak-restore-compose').checked,
+    composeUp: $('bak-restore-up').checked,
+    importDatabases: $('bak-restore-import').checked,
+  }
+  const secrets = sameVps
+    ? { accessKey: '', secretKey: '', resticPassword: '' }
+    : { accessKey: $('bak-restore-access').value, secretKey: $('bak-restore-secret').value, resticPassword: $('bak-restore-pw').value }
+  if (!sameVps && (!secrets.accessKey || !secrets.secretKey || !secrets.resticPassword)) {
+    return fail('Restoring on another VPS needs the access key, secret and restic password.')
+  }
+  if ((opts.composeUp || opts.restoreCompose) && !opts.targetPath) {
+    return fail('Enter the target compose directory (needed to restore compose files or start the stack).')
+  }
+  $('bak-restore-err').classList.add('hidden')
+  $('bak-restore-log').textContent = ''
+  $('bak-restore-outcome').classList.add('hidden')
+  $('bak-restore-runback').classList.add('hidden')
+  bakShowView('restore-run')
+  const finish = (out, cls) => {
+    const o = $('bak-restore-outcome'); o.textContent = out; o.className = cls
+    o.classList.remove('hidden'); $('bak-restore-runback').classList.remove('hidden')
+    if (bak.restoreOff) { bak.restoreOff(); bak.restoreOff = null }
+    if (bak.restoreDoneOff) { bak.restoreDoneOff(); bak.restoreDoneOff = null }
+  }
+  bak.restoreOff = EventsOn('restore:log', (line) => {
+    const el = $('bak-restore-log'); el.textContent += line + '\n'; el.scrollTop = el.scrollHeight
+  })
+  bak.restoreDoneOff = EventsOn('restore:done', (errStr) => {
+    if (errStr) finish('✗ Restore failed: ' + errStr, 'err')
+    else finish('✓ Restore complete.', 'ok')
+  })
+  RestoreBackup(targetVps, job, secrets, opts, $('bak-restore-sudo').checked)
+    .catch((e) => finish('✗ Failed to start: ' + errMsg(e), 'err'))
 }
 
 // ─────────── Tabs ───────────
@@ -2073,6 +2632,8 @@ document.addEventListener('DOMContentLoaded', () => {
   $('mig-back').addEventListener('click', () => migShowStage('setup'))
   $('mig-run').addEventListener('click', migRun)
   $('mig-reset').addEventListener('click', () => migShowStage('setup'))
+  $('mig-substack-back').addEventListener('click', () => migShowStage('setup'))
+  $('mig-substack-run').addEventListener('click', migRunMulti)
   $('mig-src').addEventListener('change', () => {
     // Avoid src == dst — pick a different (non-local) target if needed.
     if ($('mig-src').value === $('mig-dst').value) {
@@ -2080,6 +2641,40 @@ document.addEventListener('DOMContentLoaded', () => {
       if (other) $('mig-dst').value = other.id
     }
   })
+  $('mig-cleanup').addEventListener('click', async () => {
+    const srcId = $('mig-src').value
+    if (srcId && srcId !== state.selectedId) await selectVPS(srcId)
+    $('cleanup-path').value = $('mig-src-path').value.trim()
+    $('cleanup-sudo').checked = mig.useSudo
+    switchTab('cleanup')
+  })
+
+  // Cleanup
+  $('cleanup-inspect').addEventListener('click', cleanupInspect)
+  $('cleanup-back').addEventListener('click', () => cleanupShowStage('setup'))
+  $('cleanup-reset').addEventListener('click', () => cleanupShowStage('setup'))
+  $('cleanup-run').addEventListener('click', cleanupRun)
+  $('cleanup-confirm').addEventListener('input', () => {
+    $('cleanup-run').disabled = $('cleanup-confirm').value.trim() !== $('cleanup-confirm-name').textContent
+  })
+
+  // Backups
+  $('backups-refresh').addEventListener('click', backupsRefresh)
+  $('backups-sudo').addEventListener('change', backupsRefresh)
+  $('backups-add').addEventListener('click', () => bakOpenForm(null))
+  $('bak-cancel').addEventListener('click', () => bakShowView('list-view'))
+  $('bak-detect').addEventListener('click', bakDetect)
+  $('bak-provider').addEventListener('change', (e) => bakApplyProvider(e.target.value))
+  $('bak-save').addEventListener('click', bakSave)
+  $('backups-run-back').addEventListener('click', () => { bakShowView('list-view'); backupsRefresh() })
+  $('backups-snap-back').addEventListener('click', () => bakShowView('list-view'))
+  $('bak-restore-cancel').addEventListener('click', () => bakShowView('snap-view'))
+  $('bak-restore-go').addEventListener('click', bakDoRestore)
+  $('bak-restore-confirm').addEventListener('change', (e) => { $('bak-restore-go').disabled = !e.target.checked })
+  $('bak-restore-vps').addEventListener('change', bakRestoreToggleCreds)
+  $('bak-restore-runback').addEventListener('click', () => { bakShowView('list-view'); backupsRefresh() })
+  document.querySelectorAll('.bak-preset').forEach((b) =>
+    b.addEventListener('click', (e) => { e.preventDefault(); $('bak-schedule').value = b.dataset.cron }))
 
   // Terminal: keep the PTY size in sync with the panel when the window resizes.
   let resizeTimer = null

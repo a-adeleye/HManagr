@@ -78,6 +78,10 @@ export function DefaultDownloadDir() {
   return window['go']['main']['App']['DefaultDownloadDir']();
 }
 
+export function DeleteBackupJob(arg1, arg2, arg3) {
+  return window['go']['main']['App']['DeleteBackupJob'](arg1, arg2, arg3);
+}
+
 export function DeleteDeployment(arg1) {
   return window['go']['main']['App']['DeleteDeployment'](arg1);
 }
@@ -98,6 +102,14 @@ export function Disconnect(arg1) {
   return window['go']['main']['App']['Disconnect'](arg1);
 }
 
+export function DiscoverComposeContext(arg1, arg2, arg3) {
+  return window['go']['main']['App']['DiscoverComposeContext'](arg1, arg2, arg3);
+}
+
+export function DiscoverStacks(arg1, arg2, arg3) {
+  return window['go']['main']['App']['DiscoverStacks'](arg1, arg2, arg3);
+}
+
 export function DownloadFile(arg1, arg2, arg3) {
   return window['go']['main']['App']['DownloadFile'](arg1, arg2, arg3);
 }
@@ -106,16 +118,32 @@ export function FindComposeFile(arg1, arg2) {
   return window['go']['main']['App']['FindComposeFile'](arg1, arg2);
 }
 
+export function ForgetBackupSnapshot(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['ForgetBackupSnapshot'](arg1, arg2, arg3, arg4);
+}
+
 export function HasSudoPassword(arg1) {
   return window['go']['main']['App']['HasSudoPassword'](arg1);
 }
 
-export function InspectMigration(arg1, arg2, arg3) {
-  return window['go']['main']['App']['InspectMigration'](arg1, arg2, arg3);
+export function InspectMigration(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['InspectMigration'](arg1, arg2, arg3, arg4, arg5);
+}
+
+export function InspectTeardown(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['InspectTeardown'](arg1, arg2, arg3, arg4, arg5);
 }
 
 export function IsConnected(arg1) {
   return window['go']['main']['App']['IsConnected'](arg1);
+}
+
+export function ListBackupJobs(arg1, arg2) {
+  return window['go']['main']['App']['ListBackupJobs'](arg1, arg2);
+}
+
+export function ListBackupSnapshots(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ListBackupSnapshots'](arg1, arg2, arg3);
 }
 
 export function ListContainers(arg1, arg2) {
@@ -170,6 +198,14 @@ export function RestartContainer(arg1, arg2) {
   return window['go']['main']['App']['RestartContainer'](arg1, arg2);
 }
 
+export function RestoreBackup(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['RestoreBackup'](arg1, arg2, arg3, arg4, arg5);
+}
+
+export function RunBackupNow(arg1, arg2, arg3) {
+  return window['go']['main']['App']['RunBackupNow'](arg1, arg2, arg3);
+}
+
 export function RunCommand(arg1, arg2) {
   return window['go']['main']['App']['RunCommand'](arg1, arg2);
 }
@@ -184,6 +220,14 @@ export function RunDeploy(arg1) {
 
 export function RunMigration(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['RunMigration'](arg1, arg2, arg3, arg4);
+}
+
+export function RunMultiMigration(arg1, arg2, arg3, arg4, arg5, arg6) {
+  return window['go']['main']['App']['RunMultiMigration'](arg1, arg2, arg3, arg4, arg5, arg6);
+}
+
+export function SaveBackupJob(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['SaveBackupJob'](arg1, arg2, arg3, arg4);
 }
 
 export function SaveDeployment(arg1) {
@@ -216,6 +260,14 @@ export function StatRemoteFile(arg1, arg2) {
 
 export function StopContainer(arg1, arg2) {
   return window['go']['main']['App']['StopContainer'](arg1, arg2);
+}
+
+export function TeardownStack(arg1, arg2, arg3) {
+  return window['go']['main']['App']['TeardownStack'](arg1, arg2, arg3);
+}
+
+export function TestBackupTarget(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['TestBackupTarget'](arg1, arg2, arg3, arg4);
 }
 
 export function UpdateVPS(arg1) {

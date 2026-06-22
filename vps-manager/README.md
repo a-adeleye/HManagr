@@ -28,6 +28,16 @@ Built with [Wails v2](https://wails.io) (Go backend + web UI). Binary is ~15 MB.
 - **Migration** — move a docker-compose stack (compose file, env files, named
   volumes) from one VPS to another. The "use sudo" checkbox assumes passwordless
   sudo (or a root login) — no password prompting; permission failures surface as-is.
+- **Backups** — schedule off-site backups of a stack (named volumes + logical
+  database dumps + compose files) to an S3-compatible bucket with
+  [restic](https://restic.net). Jobs live on the VPS as a `/etc/cron.d` entry plus
+  config under `/etc/vps-manager/backups`, so they run on schedule even when the app
+  is closed; the app lists/creates/edits/deletes jobs and browses/prunes snapshots.
+  Bucket keys and the restic password are stored only in a root-`600` env file on
+  the VPS, never in the app config. (Restore is not yet automated — list/delete only.)
+- **Cleanup** — tear a stack down on a VPS: `docker compose down`, and optionally its
+  named volumes, images, and the stack directory. External volumes/networks are left
+  untouched; a type-to-confirm guard protects the destructive removal.
 - Interactive PTY terminal (xterm.js) with copy/paste
 - Run arbitrary shell commands with output history (`↑` / `↓` to navigate)
 - Per-VPS persistent connections (no lag from reconnecting on every action)
