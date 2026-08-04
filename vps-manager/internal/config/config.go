@@ -53,9 +53,30 @@ type Deployment struct {
 	GithubToken string   `json:"githubToken,omitempty"` // for private repos over https
 	EnvVars     []EnvVar `json:"envVars"`
 	UseSudo     bool     `json:"useSudo"`
-	LastDeploy  string   `json:"lastDeploy,omitempty"` // RFC3339
-	LastStatus  string   `json:"lastStatus,omitempty"` // running | success | failed
-	LastCommit  string   `json:"lastCommit,omitempty"`
+	// Registry* log the VPS into a container registry (e.g. ghcr.io) before
+	// `docker compose up`, so compose can pull a private pre-built image
+	// instead of needing a build context in the repo. All three empty skips
+	// the login step entirely, preserving existing deployments untouched.
+	RegistryHost     string `json:"registryHost,omitempty"`
+	RegistryUsername string `json:"registryUsername,omitempty"`
+	RegistryToken    string `json:"registryToken,omitempty"`
+	// Publish* configure an optional local build-and-push phase (see
+	// internal/publish) that runs on the machine running vps-manager BEFORE
+	// the target-side deploy: RepoURL/Branch/GithubToken are cloned into
+	// PublishLocalPath — never onto the target — built from
+	// PublishBuildContext, and pushed to PublishImageRepo via Registry*. The
+	// pushed tag is then passed to the target's `docker compose up` as an
+	// inline PublishImageEnvVar override, so the target only ever receives a
+	// pulled image, never the source checkout. Blank PublishLocalPath skips
+	// this phase entirely — the original clone-and-build-on-target and
+	// pull-only-existing-directory behaviors are unaffected.
+	PublishLocalPath    string `json:"publishLocalPath,omitempty"`
+	PublishBuildContext string `json:"publishBuildContext,omitempty"`
+	PublishImageRepo    string `json:"publishImageRepo,omitempty"`
+	PublishImageEnvVar  string `json:"publishImageEnvVar,omitempty"`
+	LastDeploy          string `json:"lastDeploy,omitempty"` // RFC3339
+	LastStatus          string `json:"lastStatus,omitempty"` // running | success | failed
+	LastCommit          string `json:"lastCommit,omitempty"`
 }
 
 // Project is a named server+path bookmark: selecting it connects to VPSID (or

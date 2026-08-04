@@ -43,25 +43,27 @@ input, button, select { font-family: inherit; user-select: text; }
 
 /* ───────── Layout ───────── */
 #app {
-  display: grid;
-  grid-template-columns: 280px 1fr;
   height: 100vh;
 }
+#app > .fleet-view,
+#app > .main {
+  height: 100%;
+}
 
-/* ───────── Sidebar ───────── */
-.sidebar {
-  background: var(--bg-elev);
-  border-right: 1px solid var(--border);
+/* ───────── Fleet (home view: live server cards) ───────── */
+.fleet-view {
   display: flex;
   flex-direction: column;
   min-height: 0;
 }
-.sidebar-header {
-  padding: 18px 16px;
+.fleet-topbar {
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  gap: 14px;
+  padding: 12px 20px;
   border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+  flex-shrink: 0;
 }
 .brand {
   display: flex;
@@ -75,147 +77,391 @@ input, button, select { font-family: inherit; user-select: text; }
   background: var(--accent);
   box-shadow: 0 0 12px var(--accent);
 }
-.sidebar-header h1 {
+.fleet-topbar h1 {
   margin: 0;
   font-size: 14px;
   font-weight: 600;
   letter-spacing: -0.01em;
 }
-/* Servers / Projects segmented switcher */
-.sidebar-switch {
-  display: flex;
-  gap: 2px;
-  padding: 8px 12px 4px;
-}
-.side-btn {
-  flex: 1;
+.fleet-spacer { flex: 1; }
+.fleet-hint { font-size: 11px; }
+
+/* Topbar pill (Projects dropdown trigger), echoing the canvas mock's chips. */
+.fleet-pill {
   background: var(--bg-elev2);
-  color: var(--text-muted);
+  color: var(--text);
   border: 1px solid var(--border);
-  padding: 5px 0;
+  border-radius: 14px;
+  padding: 5px 14px;
   font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  border-radius: var(--radius-sm);
-}
-.side-btn.active {
-  background: var(--accent-dim);
-  color: var(--accent);
-  border-color: transparent;
   font-weight: 600;
+  cursor: pointer;
+  transition: border-color 120ms ease;
 }
-.vps-list {
-  list-style: none;
-  padding: 8px;
-  margin: 0;
+.fleet-pill:hover { border-color: var(--border-strong); }
+.fleet-pill .caret { color: var(--text-muted); margin-left: 3px; }
+
+.fleet-proj-wrap { position: relative; }
+.fleet-proj-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  min-width: 320px;
+  max-height: 60vh;
   overflow-y: auto;
-  flex: 1;
+  background: var(--bg-elev2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  padding: 6px;
+  z-index: 50;
 }
-/* Project rows reuse .vps-item; this badges the deploy path. */
-.vps-list li.vps-item .proj-path {
+.fleet-proj-empty {
+  padding: 16px 12px;
+  font-size: 12px;
+  text-align: center;
+}
+.fleet-proj-row {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  position: relative;
+}
+.fleet-proj-row:hover { background: var(--bg-elev3); }
+.fleet-proj-row.active { background: var(--accent-dim); }
+.fleet-proj-row .fp-main {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.fleet-proj-row .fp-name { font-weight: 600; font-size: 13px; }
+.fleet-proj-row .fp-server { font-size: 11px; }
+.fleet-proj-row .fp-path {
   font-size: 11px;
   color: var(--text-faint);
-  font-family: var(--mono);
-  padding-left: 15px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.vps-list li.vps-item .proj-actions {
-  margin-left: auto;
+.fleet-proj-row .proj-actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
   display: flex;
   gap: 2px;
   opacity: 0;
   transition: opacity 120ms ease;
 }
-.vps-list li.vps-item:hover .proj-actions { opacity: 1; }
-.vps-list li.vps-item .proj-actions button {
-  background: transparent;
-  border: none;
+.fleet-proj-row:hover .proj-actions { opacity: 1; }
+.fleet-proj-row .proj-actions button {
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
   color: var(--text-muted);
   cursor: pointer;
   font-size: 11px;
-  padding: 1px 5px;
+  padding: 1px 7px;
   border-radius: 3px;
 }
-.vps-list li.vps-item .proj-actions button:hover {
-  color: var(--text);
-  background: var(--bg-elev3);
+.fleet-proj-row .proj-actions button:hover { color: var(--text); }
+
+/* The canvas: a dotted field the cards sit on, like a service graph. */
+.fleet-canvas {
+  flex: 1;
+  overflow-y: auto;
+  padding: 28px;
+  background-image: radial-gradient(rgba(232, 237, 245, 0.05) 1px, transparent 1.2px);
+  background-size: 22px 22px;
 }
-.vps-empty {
-  padding: 24px 12px;
+.fleet-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 18px;
+  align-items: start;
+  max-width: 1500px;
+  margin: 0 auto;
+}
+.fleet-empty {
+  grid-column: 1 / -1;
   text-align: center;
-  font-size: 13px;
+  padding: 70px 20px;
 }
-.vps-list li.vps-item {
-  padding: 10px 12px;
-  border-radius: var(--radius);
+.fleet-empty h2 {
+  margin: 0 0 6px;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.fleet-empty p { margin: 0; font-size: 13px; }
+
+/* ── server card ──
+   Each card carries its server's accent as --ca (an "r, g, b" triplet set by
+   the JS), so the top strip, icon chip and meters color-code per server. */
+.fleet-card {
+  --ca: 76, 141, 255;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-top: 2px solid rgba(var(--ca), 0.65);
+  border-radius: 10px;
   cursor: pointer;
+  overflow: hidden;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+.fleet-card:hover {
+  border-color: rgba(var(--ca), 0.45);
+  border-top-color: rgba(var(--ca), 0.85);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+}
+.fleet-card.expanded {
+  grid-column: 1 / -1;
+  border-color: rgba(var(--ca), 0.5);
+  border-top-color: rgba(var(--ca), 0.9);
+}
+.fleet-card.offline { border-top-color: rgba(var(--ca), 0.28); }
+.fleet-card.unavailable { opacity: 0.55; }
+
+.fc-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px 8px;
+}
+.fc-icon {
+  font-size: 14px;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: rgba(var(--ca), 0.13);
+  flex-shrink: 0;
+}
+.fc-title {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  margin-bottom: 2px;
-  border-left: 2px solid transparent;
-  transition: background 120ms ease;
+  gap: 1px;
 }
-.vps-list li.vps-item:hover {
-  background: var(--bg-elev2);
+.fc-name {
+  font-weight: 600;
+  font-size: 14px;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.vps-list li.vps-item.active {
-  background: var(--bg-elev2);
-  border-left-color: var(--accent);
+.fc-host {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-/* The virtual "Local (this machine)" entry, pinned at the top. */
-.vps-list li.vps-item.local {
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 6px;
-  padding-bottom: 12px;
-}
-.vps-list li.vps-item.local.unavailable .name {
-  color: var(--text-faint);
-}
-.vps-list li.vps-item.local.unavailable .host {
-  color: var(--danger);
-  font-style: italic;
-}
-.vps-list li.vps-item.local .name::after {
-  content: 'LOCAL';
-  font-size: 9px;
+.fc-status {
+  font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.06em;
-  color: var(--accent);
-  background: var(--accent-dim);
-  padding: 1px 5px;
-  border-radius: 3px;
-  margin-left: 7px;
-  vertical-align: middle;
+  text-transform: uppercase;
+  flex-shrink: 0;
 }
-.vps-list .name-row {
+.fc-status.online { color: var(--success); }
+.fc-status.online.stale { color: var(--warning); }
+.fc-status.offline { color: var(--text-faint); }
+.fc-status.connecting { color: var(--warning); }
+
+.fc-meta {
+  padding: 0 16px 10px;
+  font-size: 11px;
+  color: var(--text-faint);
+  min-height: 17px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* CPU / RAM / DISK chips — hairline-separated cells like the mock's meters. */
+.fc-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 1px;
+  background: var(--border);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.fc-metric {
+  background: var(--bg-elev2);
+  padding: 8px 11px 9px;
+  min-width: 0;
+}
+.fc-m-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 6px;
+}
+.fc-m-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.fc-m-val {
+  font-size: 13px;
+  font-weight: 600;
+}
+.fc-m-sub {
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fc-m-bar {
+  height: 3px;
+  background: var(--bg);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 6px;
+}
+.fc-m-bar i {
+  display: block;
+  height: 100%;
+  background: rgb(var(--ca, 76, 141, 255));
+  border-radius: 2px;
+  transition: width 600ms ease;
+}
+.fc-m-bar i.warm { background: var(--warning); }
+.fc-m-bar i.hot { background: var(--danger); }
+.fleet-card.offline .fc-metric { opacity: 0.5; }
+
+.fc-foot {
   display: flex;
   align-items: center;
   gap: 8px;
+  padding: 10px 12px;
 }
-.vps-list .dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--text-faint);
+.fc-foot-spacer { flex: 1; }
+.fc-foot .btn { padding: 5px 12px; font-size: 12px; }
+
+/* ── expanded card: compose stacks as tinted group boxes ── */
+.fc-stacks {
+  padding: 2px 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  cursor: default;
+}
+.fc-stacks-msg {
+  margin: 6px 4px;
+  font-size: 12px;
+}
+.stack-group {
+  border: 1px dashed var(--border-strong);
+  border-radius: 10px;
+  padding: 12px;
+}
+.sg-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.sg-icon { color: var(--text-muted); font-size: 12px; }
+.sg-name { font-weight: 600; font-size: 13px; }
+.sg-count {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+.sg-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 10px;
+}
+
+/* one service (container) tile inside a stack group */
+.svc-tile {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px 9px;
+  min-width: 0;
+}
+.svc-tile.stopped { opacity: 0.65; }
+.svc-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.svc-icon { font-size: 13px; }
+.svc-name {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.svc-badge {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 2px 7px;
+  border-radius: 3px;
   flex-shrink: 0;
 }
-.vps-list .dot.connected {
-  background: var(--success);
-  box-shadow: 0 0 8px var(--success);
-}
-.vps-list .name {
-  font-weight: 500;
-  font-size: 13px;
-}
-.vps-list .host {
+.svc-badge.run { color: var(--success); background: rgba(61, 220, 151, 0.12); }
+.svc-badge.stopped { color: var(--danger); background: rgba(255, 107, 107, 0.1); }
+.svc-badge.restarting { color: var(--warning); background: rgba(244, 185, 66, 0.12); }
+.svc-image {
   font-size: 11px;
   color: var(--text-muted);
-  font-family: var(--mono);
-  padding-left: 15px;
+  margin: 3px 0 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
+.svc-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.svc-m { min-width: 0; }
+.svc-m-label {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  margin-right: 5px;
+}
+.svc-m-val { font-size: 11px; }
+.svc-m .fc-m-bar { margin-top: 4px; }
+.svc-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 9px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.svc-tile:hover .svc-actions { opacity: 1; }
+.svc-actions button {
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 3px;
+}
+.svc-actions button:hover { color: var(--text); border-color: var(--border-strong); }
+.svc-actions button:disabled { opacity: 0.5; cursor: default; }
+
 
 /* ───────── Main ───────── */
 .main {
@@ -224,20 +470,6 @@ input, button, select { font-family: inherit; user-select: text; }
   min-height: 0;
   overflow: hidden;
 }
-.empty-state {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-}
-.empty-inner h2 {
-  font-size: 22px;
-  margin: 0 0 6px;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-}
-.empty-inner p { margin: 0; }
-.empty-inner { text-align: center; }
 
 .vps-view {
   display: flex;
@@ -456,6 +688,8 @@ input, button, select { font-family: inherit; user-select: text; }
   align-items: center;
   gap: 12px;
 }
+/* Name filter — flexes but stays narrow enough to leave room for the scope note. */
+.docker-search { flex: 0 1 240px; min-width: 120px; }
 .docker-list {
   flex: 1;
   overflow-y: auto;
@@ -531,6 +765,147 @@ input, button, select { font-family: inherit; user-select: text; }
   height: 100% !important;
 }
 #terminal-placeholder { margin: auto; }
+
+/* ───────── Ask (Codex CLI over MCP) ───────── */
+.ask-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.ask-transcript {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 860px;
+  margin: 0 auto;
+  width: 100%;
+}
+.ask-intro {
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 4px 0 10px;
+}
+.ask-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.ask-suggestion {
+  background: var(--bg-elev2);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease;
+}
+.ask-suggestion:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+/* One entry in the transcript: a user prompt, an agent message, a tool call,
+   or an error — .kind selects the accent. */
+.ask-entry {
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.55;
+  max-width: 100%;
+}
+.ask-entry.user {
+  background: var(--accent-dim);
+  align-self: flex-end;
+  max-width: 80%;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ask-entry.message {
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ask-entry.error {
+  background: rgba(255, 107, 107, 0.1);
+  border-left: 3px solid var(--danger);
+  color: #ffb4b4;
+  font-size: 12px;
+}
+.ask-entry.status {
+  color: var(--text-faint);
+  font-size: 12px;
+  font-style: italic;
+  background: none;
+  padding: 2px 14px;
+}
+.ask-tool {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.ask-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+.ask-tool-head .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex-shrink: 0;
+}
+.ask-tool.in_progress .dot { background: var(--warning); box-shadow: 0 0 6px var(--warning); }
+.ask-tool.completed .dot { background: var(--success); }
+.ask-tool.failed .dot { background: var(--danger); }
+.ask-tool-head .name { color: var(--text); }
+.ask-tool-detail {
+  display: none;
+  padding: 0 12px 10px 27px;
+  color: var(--text-faint);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.ask-tool.open .ask-tool-detail { display: block; }
+.ask-inputrow {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  padding: 14px 24px;
+  border-top: 1px solid var(--border);
+  max-width: 860px;
+  margin: 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+.ask-inputrow textarea {
+  flex: 1;
+  resize: none;
+  max-height: 140px;
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.ask-inputrow textarea:focus { outline: none; border-color: var(--accent); }
+.ask-inputrow .checkbox-row { margin: 0 0 7px; }
 
 /* ───────── Modal ───────── */
 .modal {
@@ -1035,6 +1410,31 @@ input, button, select { font-family: inherit; user-select: text; }
   text-transform: uppercase;
   margin-top: 4px;
 }
+.deploy-env-head-actions { display: flex; gap: 8px; }
+.deploy-env-import {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--bg-elev2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+}
+.deploy-env-import textarea {
+  width: 100%;
+  min-height: 100px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 9px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  outline: none;
+  resize: vertical;
+}
+.deploy-env-import textarea:focus { border-color: var(--accent); }
+.deploy-env-import-actions { display: flex; align-items: center; gap: 8px; }
+.deploy-env-import-actions .spacer { flex: 1; }
 .deploy-env-rows { display: flex; flex-direction: column; gap: 6px; }
 .deploy-env-row {
   display: grid;

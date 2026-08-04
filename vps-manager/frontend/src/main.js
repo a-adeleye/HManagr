@@ -26,10 +26,12 @@ import {
   ListBackupJobs, SaveBackupJob, DeleteBackupJob, RunBackupNow,
   ListBackupSnapshots, ForgetBackupSnapshot, TestBackupTarget, RestoreBackup,
   SystemUsage, PruneDocker, SystemLargestImages,
+  HostStats, ContainerStats,
   ProvisionDatabaseEngines, ProvisionDatabase,
   DetectCaddyProxy, ExposeServiceDomain, CloudflareUpsert,
+  AskAIAvailable, StartAIQuery, StopAIQuery,
 } from '../wailsjs/go/main/App'
-import { EventsOn } from '../wailsjs/runtime/runtime'
+import { EventsOn, BrowserOpenURL } from '../wailsjs/runtime/runtime'
 
 // ─────────── State ───────────
 const state = {
@@ -48,8 +50,10 @@ const isLocalSel = () => state.selectedId === 'local'
 state.localAvailable = true
 state.localReason = ''
 
-// Projects: named server+path bookmarks. sidebar toggles the list shown.
-state.sidebar = 'servers'      // 'servers' | 'projects'
+// Which top-level view is showing: the fleet canvas (home) or a server detail.
+state.view = 'fleet'           // 'fleet' | 'detail'
+
+// Projects: named server+path bookmarks, listed in the fleet topbar dropdown.
 state.projects = []
 state.activeProjectId = null   // project currently open (for highlight)
 state.projectPath = null       // deploy path the current session is rooted at
@@ -58,6 +62,9 @@ state.pendingProjectPath = null // set by openProject, consumed by selectVPS
 // unless the user opts to see everything on the server.
 state.dockerShowAll = false
 state.dbShowAll = false
+// Docker tab: last fetched containers, filtered client-side by a name substring.
+state.dockerContainers = []
+state.dockerFilter = ''
 
 // Interactive terminal (xterm.js) bound to a single PTY shell at a time.
 const term = {
@@ -96,7 +103,7 @@ const errMsg = (e) => (e && e.message) ? e.message : String(e)
 // ─────────── VPS list ───────────
 async function refreshVPSList() {
   state.vpses = await ListVPS() || []
-  renderVPSList()
+  renderFleet()
 }
 
 // Resolve whether local mode is usable (a host POSIX shell was found). When not,
@@ -110,42 +117,525 @@ async function refreshLocalAvailability() {
     state.localAvailable = true
     state.localReason = ''
   }
-  renderVPSList()
+  renderFleet()
 }
 
-function renderVPSList() {
-  const ul = $('vps-list')
-  ul.innerHTML = ''
-  for (const v of state.vpses) {
-    const li = document.createElement('li')
-    const localUnavail = v.isLocal && !state.localAvailable
-    li.className = 'vps-item' + (state.selectedId === v.id ? ' active' : '') +
-      (v.isLocal ? ' local' : '') + (localUnavail ? ' unavailable' : '')
-    li.dataset.id = v.id
-    const isConnected = state.selectedId === v.id && state.connected
-    li.innerHTML = `
-      <div class="name-row">
-        <span class="dot ${isConnected ? 'connected' : ''}"></span>
-        <span class="name"></span>
+// ─────────── Fleet (home view: live server cards) ───────────
+//
+// The fleet canvas shows one card per server with live CPU / RAM / DISK
+// meters, refreshed on a poll loop. Clicking a card expands it to show the
+// containers running inside, grouped by compose stack, each with its own live
+// usage. "Open" enters the classic detail view (tabs).
+const fleet = {
+  conn: {},          // vpsId -> live connection state
+  stats: {},         // vpsId -> last Host snapshot
+  containers: {},    // vpsId -> last Container[] (expanded card only)
+  stale: {},         // vpsId -> true when the last stats poll failed
+  expandedId: null,  // card currently expanded to show its containers
+  timer: null,
+  inflight: new Set(),   // vpsIds with a poll in progress (re-entrancy guard)
+  connecting: new Set(), // vpsIds with a connect in progress
+}
+const FLEET_POLL_MS = 6000
+
+// ── view switching ──
+function showFleetView() {
+  state.view = 'fleet'
+  $('main-view').classList.add('hidden')
+  $('fleet-view').classList.remove('hidden')
+  renderFleet()
+  fleetPoll()
+}
+
+function showDetailView() {
+  state.view = 'detail'
+  $('fleet-view').classList.add('hidden')
+  $('main-view').classList.remove('hidden')
+}
+
+// ── formatting ──
+// fmtShortBytes renders a byte count the way the cards' chips want it:
+// compact, no space, one decimal only when it matters ("7.8G", "512M").
+function fmtShortBytes(n) {
+  if (!n || n <= 0) return '0'
+  const units = ['B', 'K', 'M', 'G', 'T', 'P']
+  let v = n, u = 0
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u++ }
+  const s = v >= 10 || u === 0 ? Math.round(v).toString() : v.toFixed(1)
+  return s + units[u]
+}
+
+const fmtPct = (v) => (v == null || v < 0) ? '—' : Math.round(v) + '%'
+
+function fmtUptime(secs) {
+  if (!secs || secs <= 0) return ''
+  const d = Math.floor(secs / 86400)
+  const h = Math.floor((secs % 86400) / 3600)
+  const m = Math.floor((secs % 3600) / 60)
+  if (d > 0) return `${d}d ${h}h`
+  if (h > 0) return `${h}h ${m}m`
+  return `${m}m`
+}
+
+// barClass colors a meter by pressure: calm → warm (>70%) → hot (>85%).
+function barClass(pct) {
+  if (pct == null || pct < 0) return ''
+  if (pct > 85) return ' hot'
+  if (pct > 70) return ' warm'
+  return ''
+}
+
+// Each server gets a stable accent color so cards are tellable at a glance.
+// The hue is picked by hashing the VPS id, so it never changes across
+// sessions or reorderings; Local always gets the neutral slate.
+const CARD_HUES = [
+  [76, 141, 255],   // blue
+  [61, 220, 151],   // green
+  [178, 132, 255],  // purple
+  [244, 185, 66],   // amber
+  [86, 204, 242],   // cyan
+  [255, 138, 101],  // coral
+  [240, 98, 146],   // pink
+  [156, 204, 101],  // lime
+]
+const LOCAL_HUE = [138, 146, 166] // slate — the odd one out on purpose
+
+function cardAccent(v) {
+  if (v.isLocal) return LOCAL_HUE
+  let h = 0
+  for (let i = 0; i < v.id.length; i++) h = (h * 31 + v.id.charCodeAt(i)) >>> 0
+  return CARD_HUES[h % CARD_HUES.length]
+}
+
+// svcIcon picks a glyph for a container the way the canvas mock does: globe
+// for web-facing things, cylinder for datastores, gear for background work.
+function svcIcon(image, name) {
+  const s = (String(image) + ' ' + String(name)).toLowerCase()
+  if (/postgres|mysql|maria|mongo|redis|valkey|clickhouse|elastic|minio|rabbitmq|kafka|memcache/.test(s)) return '🗃'
+  if (/nginx|caddy|traefik|haproxy|storefront|frontend|web|admin|ui/.test(s)) return '🌐'
+  if (/worker|queue|cron|job|beat|scheduler/.test(s)) return '⚙'
+  return '📦'
+}
+
+// ── rendering ──
+function renderFleet() {
+  const grid = $('fleet-grid')
+  grid.innerHTML = ''
+  for (const v of state.vpses) grid.appendChild(buildFleetCard(v))
+  if (!state.vpses.some((x) => !x.isLocal)) {
+    const hint = document.createElement('div')
+    hint.className = 'fleet-empty'
+    hint.innerHTML = '<h2>No servers yet</h2><p class="muted">Add your first VPS with <b>+ Server</b> — it appears here as a live card.</p>'
+    grid.appendChild(hint)
+  }
+}
+
+// metricChip is one CPU/RAM/DISK cell of a card. Values are patched in place
+// by updateFleetCard so the bar animates instead of re-rendering.
+function metricChip(kind, label) {
+  return `
+    <div class="fc-metric" data-metric="${kind}">
+      <div class="fc-m-top"><span class="fc-m-label">${label}</span><span class="fc-m-val mono">—</span></div>
+      <div class="fc-m-sub mono">&nbsp;</div>
+      <div class="fc-m-bar"><i style="width:0%"></i></div>
+    </div>`
+}
+
+function buildFleetCard(v) {
+  const card = document.createElement('div')
+  const connected = !!fleet.conn[v.id]
+  const localUnavail = v.isLocal && !state.localAvailable
+  card.className = 'fleet-card' +
+    (fleet.expandedId === v.id ? ' expanded' : '') +
+    (connected ? '' : ' offline') +
+    (localUnavail ? ' unavailable' : '')
+  card.dataset.id = v.id
+  // The accent rides a CSS variable as a raw "r, g, b" triplet so the styles
+  // can derive washes at any alpha via rgba(var(--ca), …).
+  card.style.setProperty('--ca', cardAccent(v).join(', '))
+  card.innerHTML = `
+    <div class="fc-head">
+      <span class="fc-icon">${v.isLocal ? '🖥' : '🌐'}</span>
+      <div class="fc-title">
+        <span class="fc-name"></span>
+        <span class="fc-host mono"></span>
       </div>
-      <div class="host"></div>
+      <span class="fc-status"></span>
+    </div>
+    <div class="fc-meta mono"></div>
+    <div class="fc-metrics">
+      ${metricChip('cpu', '⛭ CPU')}
+      ${metricChip('mem', '▤ RAM')}
+      ${metricChip('disk', '⛁ DISK')}
+    </div>
+    <div class="fc-foot">
+      <button class="btn btn-secondary fc-conn"></button>
+      <span class="fc-foot-spacer"></span>
+      <button class="btn fc-open">Open →</button>
+    </div>
+    <div class="fc-stacks hidden"></div>
+  `
+  card.querySelector('.fc-name').textContent = v.name
+  card.querySelector('.fc-host').textContent = v.isLocal
+    ? (localUnavail ? (state.localReason || 'unavailable on this machine') : 'this machine — no SSH')
+    : `${v.user}@${v.host}:${v.port || 22}`
+  if (localUnavail) card.title = state.localReason || ''
+
+  const connBtn = card.querySelector('.fc-conn')
+  if (fleet.connecting.has(v.id)) {
+    connBtn.textContent = 'Connecting…'
+    connBtn.disabled = true
+  } else {
+    connBtn.textContent = connected ? 'Disconnect' : 'Connect'
+  }
+  connBtn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    connected ? fleetDisconnect(v.id) : fleetConnect(v.id)
+  })
+  card.querySelector('.fc-open').addEventListener('click', (e) => {
+    e.stopPropagation()
+    openDetail(v.id)
+  })
+  card.addEventListener('click', () => toggleExpand(v.id))
+  card.addEventListener('dblclick', () => openDetail(v.id))
+  // Clicks inside the stacks area (tiles, empty space between them) shouldn't
+  // collapse the card.
+  card.querySelector('.fc-stacks').addEventListener('click', (e) => e.stopPropagation())
+
+  updateFleetCard(v.id, card)
+  if (fleet.expandedId === v.id) renderStacks(v.id, card)
+  return card
+}
+
+// updateFleetCard patches a card's live values (status chip, meta line,
+// metric chips) without rebuilding its DOM, so bars animate smoothly.
+function updateFleetCard(id, card = null) {
+  card = card || $('fleet-grid').querySelector(`.fleet-card[data-id="${CSS.escape(id)}"]`)
+  if (!card) return
+  const connected = !!fleet.conn[id]
+  const st = fleet.stats[id]
+
+  const status = card.querySelector('.fc-status')
+  if (fleet.connecting.has(id)) {
+    status.textContent = '● connecting'
+    status.className = 'fc-status connecting'
+  } else if (connected) {
+    status.textContent = fleet.stale[id] ? '● stale' : '● online'
+    status.className = 'fc-status online' + (fleet.stale[id] ? ' stale' : '')
+  } else {
+    status.textContent = '○ offline'
+    status.className = 'fc-status offline'
+  }
+
+  const meta = card.querySelector('.fc-meta')
+  if (!connected) {
+    meta.textContent = 'not connected'
+  } else if (!st) {
+    meta.textContent = 'reading metrics…'
+  } else if (!st.available) {
+    meta.textContent = 'metrics unavailable on this host'
+  } else {
+    const bits = []
+    if (st.uptimeSecs > 0) bits.push('up ' + fmtUptime(st.uptimeSecs))
+    if (st.load1 >= 0) bits.push('load ' + st.load1.toFixed(2))
+    const n = (fleet.containers[id] || []).filter((c) => (c.state || '').toLowerCase() === 'running').length
+    if (fleet.expandedId === id && n > 0) bits.push(n + ' running')
+    meta.textContent = bits.join(' · ') || ' '
+  }
+
+  const setChip = (kind, pct, val, sub) => {
+    const chip = card.querySelector(`.fc-metric[data-metric="${kind}"]`)
+    if (!chip) return
+    chip.querySelector('.fc-m-val').textContent = val
+    chip.querySelector('.fc-m-sub').innerHTML = sub || '&nbsp;'
+    const bar = chip.querySelector('.fc-m-bar i')
+    bar.style.width = (pct != null && pct >= 0 ? Math.min(100, pct) : 0) + '%'
+    bar.className = barClass(pct).trim()
+  }
+  if (connected && st) {
+    setChip('cpu', st.cpuPercent, fmtPct(st.cpuPercent),
+      st.cores > 0 ? st.cores + (st.cores === 1 ? ' core' : ' cores') : '')
+    setChip('mem', st.memPercent, fmtPct(st.memPercent),
+      st.memTotal > 0 ? `${fmtShortBytes(st.memUsed)} / ${fmtShortBytes(st.memTotal)}` : '')
+    setChip('disk', st.diskPercent, fmtPct(st.diskPercent),
+      st.diskTotal > 0 ? `${fmtShortBytes(st.diskUsed)} / ${fmtShortBytes(st.diskTotal)}` : '')
+  } else {
+    setChip('cpu', -1, '—', ''); setChip('mem', -1, '—', ''); setChip('disk', -1, '—', '')
+  }
+}
+
+// ── expanded card: containers grouped by compose stack ──
+async function toggleExpand(id) {
+  if (fleet.expandedId === id) {
+    fleet.expandedId = null
+    renderFleet()
+    return
+  }
+  fleet.expandedId = id
+  renderFleet()
+  if (!fleet.conn[id]) return
+  const card = $('fleet-grid').querySelector(`.fleet-card[data-id="${CSS.escape(id)}"]`)
+  if (card && !fleet.containers[id]) {
+    card.querySelector('.fc-stacks').innerHTML = '<p class="muted fc-stacks-msg">Reading containers…</p>'
+    card.querySelector('.fc-stacks').classList.remove('hidden')
+  }
+  try {
+    fleet.containers[id] = await ContainerStats(id) || []
+    renderStacks(id)
+  } catch (e) {
+    const c = $('fleet-grid').querySelector(`.fleet-card[data-id="${CSS.escape(id)}"]`)
+    if (c && fleet.expandedId === id) {
+      const el = c.querySelector('.fc-stacks')
+      el.classList.remove('hidden')
+      el.innerHTML = ''
+      const p = document.createElement('p')
+      p.className = 'muted fc-stacks-msg'
+      p.textContent = 'Couldn’t read containers: ' + errMsg(e)
+      el.appendChild(p)
+    }
+  }
+}
+
+// stackTints rotates through subtle hue washes for the group boxes, echoing
+// the canvas mock's blue/green/neutral zones.
+const stackTints = [
+  ['rgba(76, 141, 255, 0.07)', 'rgba(76, 141, 255, 0.28)'],   // blue
+  ['rgba(61, 220, 151, 0.06)', 'rgba(61, 220, 151, 0.26)'],   // green
+  ['rgba(178, 132, 255, 0.07)', 'rgba(178, 132, 255, 0.28)'], // purple
+  ['rgba(244, 185, 66, 0.06)', 'rgba(244, 185, 66, 0.26)'],   // amber
+]
+
+function renderStacks(id, card = null) {
+  card = card || $('fleet-grid').querySelector(`.fleet-card[data-id="${CSS.escape(id)}"]`)
+  if (!card || fleet.expandedId !== id) return
+  const wrap = card.querySelector('.fc-stacks')
+  wrap.classList.remove('hidden')
+  if (!fleet.conn[id]) {
+    delete wrap.dataset.cids
+    wrap.innerHTML = '<p class="muted fc-stacks-msg">Connect to see what’s running inside.</p>'
+    return
+  }
+  const containers = fleet.containers[id]
+  if (!containers) return
+  if (!containers.length) {
+    wrap.innerHTML = '<p class="muted fc-stacks-msg">No containers on this server.</p>'
+    return
+  }
+
+  // If the container set is unchanged, patch tiles in place (smooth bars).
+  const ids = containers.map((c) => c.id).sort().join(',')
+  if (wrap.dataset.cids === ids) {
+    for (const c of containers) patchSvcTile(wrap, c)
+    return
+  }
+  wrap.dataset.cids = ids
+
+  // Group by compose project; standalone containers get their own group.
+  const groups = new Map()
+  for (const c of containers) {
+    const key = c.project || ''
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(c)
+  }
+
+  wrap.innerHTML = ''
+  let gi = 0
+  for (const [project, list] of groups) {
+    const [bg, border] = stackTints[gi++ % stackTints.length]
+    const group = document.createElement('div')
+    group.className = 'stack-group'
+    group.style.background = bg
+    group.style.borderColor = border
+    const running = list.filter((c) => (c.state || '').toLowerCase() === 'running').length
+    group.innerHTML = `
+      <div class="sg-head">
+        <span class="sg-icon">⌗</span>
+        <span class="sg-name"></span>
+        <span class="sg-count mono">${running}/${list.length} running</span>
+      </div>
+      <div class="sg-grid"></div>
     `
-    li.querySelector('.name').textContent = v.name
-    li.querySelector('.host').textContent = v.isLocal
-      ? (localUnavail ? (state.localReason || 'unavailable on this machine') : '🖥  this machine')
-      : `${v.user}@${v.host}:${v.port || 22}`
-    if (localUnavail) li.title = state.localReason || ''
-    li.addEventListener('click', () => selectVPS(v.id))
-    ul.appendChild(li)
+    group.querySelector('.sg-name').textContent = project || 'containers'
+    const sgGrid = group.querySelector('.sg-grid')
+    for (const c of list) sgGrid.appendChild(buildSvcTile(id, c))
+    wrap.appendChild(group)
   }
-  // The synthetic Local entry is always present, so the list is never empty;
-  // show the "add a server" hint only when there are no real (SSH) servers.
-  if (!state.vpses.some((v) => !v.isLocal)) {
-    const li = document.createElement('li')
-    li.className = 'vps-empty muted'
-    li.textContent = 'No servers yet. Click + to add one.'
-    ul.appendChild(li)
+}
+
+function buildSvcTile(vpsId, c) {
+  const tile = document.createElement('div')
+  const running = (c.state || '').toLowerCase() === 'running'
+  tile.className = 'svc-tile' + (running ? '' : ' stopped')
+  tile.dataset.cid = c.id
+  // image:tag without the registry path, like the mock's "storefront:2.4.0"
+  const shortImage = String(c.image || '').split('/').pop()
+  tile.innerHTML = `
+    <div class="svc-head">
+      <span class="svc-icon">${svcIcon(c.image, c.name)}</span>
+      <span class="svc-name"></span>
+      <span class="svc-badge"></span>
+    </div>
+    <div class="svc-image mono"></div>
+    <div class="svc-metrics">
+      <div class="svc-m" data-m="cpu">
+        <span class="svc-m-label">CPU</span><span class="svc-m-val mono">—</span>
+        <div class="fc-m-bar"><i style="width:0%"></i></div>
+      </div>
+      <div class="svc-m" data-m="mem">
+        <span class="svc-m-label">RAM</span><span class="svc-m-val mono">—</span>
+        <div class="fc-m-bar"><i style="width:0%"></i></div>
+      </div>
+    </div>
+    <div class="svc-actions"></div>
+  `
+  tile.querySelector('.svc-name').textContent = c.service || c.name
+  tile.querySelector('.svc-image').textContent = shortImage
+  tile.querySelector('.svc-image').title = `${c.name} · ${c.image}`
+
+  const actions = tile.querySelector('.svc-actions')
+  const act = (label, fn) => {
+    const b = document.createElement('button')
+    b.textContent = label
+    b.addEventListener('click', async (e) => {
+      e.stopPropagation()
+      b.disabled = true
+      try { await fn() } catch (err) { alert('Action failed: ' + errMsg(err)) }
+      b.disabled = false
+    })
+    actions.appendChild(b)
   }
+  const refresh = async () => {
+    fleet.containers[vpsId] = await ContainerStats(vpsId) || []
+    renderStacks(vpsId)
+  }
+  if (running) {
+    act('restart', async () => { await RestartContainer(vpsId, c.id); await refresh() })
+    act('stop', async () => { await StopContainer(vpsId, c.id); await refresh() })
+  } else {
+    act('start', async () => { await StartContainer(vpsId, c.id); await refresh() })
+  }
+  act('logs', async () => {
+    await openDetail(vpsId)
+    await showLogs(c.id, c.name)
+  })
+
+  patchSvcTile(tile.parentElement || tile, c, tile)
+  return tile
+}
+
+// patchSvcTile updates one tile's badge + metric values in place.
+function patchSvcTile(scope, c, tile = null) {
+  tile = tile || scope.querySelector(`.svc-tile[data-cid="${CSS.escape(c.id)}"]`)
+  if (!tile) return
+  const stateName = (c.state || '').toLowerCase()
+  const running = stateName === 'running'
+  tile.classList.toggle('stopped', !running)
+  const badge = tile.querySelector('.svc-badge')
+  badge.textContent = running ? 'RUN' : (stateName || 'stopped').toUpperCase()
+  badge.className = 'svc-badge ' + (running ? 'run' : (stateName === 'restarting' ? 'restarting' : 'stopped'))
+  badge.title = c.status || ''
+
+  const set = (kind, pct, text) => {
+    const m = tile.querySelector(`.svc-m[data-m="${kind}"]`)
+    if (!m) return
+    m.querySelector('.svc-m-val').textContent = text
+    const bar = m.querySelector('.fc-m-bar i')
+    bar.style.width = (pct >= 0 ? Math.min(100, pct) : 0) + '%'
+    bar.className = barClass(pct).trim()
+  }
+  set('cpu', running ? c.cpuPercent : -1, running ? fmtPct(c.cpuPercent) : '—')
+  const memText = running && c.memUsed > 0
+    ? `${fmtShortBytes(c.memUsed)}${c.memLimit > 0 ? ' / ' + fmtShortBytes(c.memLimit) : ''}`
+    : '—'
+  set('mem', running ? c.memPercent : -1, memText)
+}
+
+// ── polling ──
+function startFleetPolling() {
+  if (fleet.timer) return
+  fleet.timer = setInterval(fleetPoll, FLEET_POLL_MS)
+  fleetPoll()
+}
+
+async function fleetPoll() {
+  await Promise.all(state.vpses.map((v) => fleetPollOne(v)))
+}
+
+async function fleetPollOne(v) {
+  if (fleet.inflight.has(v.id) || fleet.connecting.has(v.id)) return
+  fleet.inflight.add(v.id)
+  try {
+    let conn = false
+    try { conn = await IsConnected(v.id) } catch {}
+    const changed = !!fleet.conn[v.id] !== conn
+    fleet.conn[v.id] = conn
+    if (changed && state.view === 'fleet') {
+      // Structural change (Connect ↔ Disconnect button) → rebuild the grid.
+      renderFleet()
+    }
+    if (!conn) {
+      delete fleet.stats[v.id]
+      delete fleet.containers[v.id]
+      return
+    }
+    try {
+      fleet.stats[v.id] = await HostStats(v.id)
+      fleet.stale[v.id] = false
+    } catch {
+      fleet.stale[v.id] = true
+    }
+    if (state.view === 'fleet') updateFleetCard(v.id)
+    if (fleet.expandedId === v.id) {
+      try {
+        fleet.containers[v.id] = await ContainerStats(v.id) || []
+        if (state.view === 'fleet') renderStacks(v.id)
+      } catch {}
+    }
+  } finally {
+    fleet.inflight.delete(v.id)
+  }
+}
+
+// ── card actions ──
+async function fleetConnect(id) {
+  if (fleet.connecting.has(id)) return
+  fleet.connecting.add(id)
+  renderFleet()
+  try {
+    await connectFlow(id)
+    fleet.conn[id] = true
+    if (state.selectedId === id) {
+      state.connected = true
+      updateStatusUI()
+    }
+  } catch (e) {
+    alert('Connection failed: ' + errMsg(e))
+  } finally {
+    fleet.connecting.delete(id)
+    renderFleet()
+    fleetPoll()
+  }
+}
+
+async function fleetDisconnect(id) {
+  if (term.vpsId === id) {
+    await detachShell()
+    resetTerminalPanel()
+  }
+  try { await Disconnect(id) } catch {}
+  fleet.conn[id] = false
+  delete fleet.stats[id]
+  delete fleet.containers[id]
+  if (state.selectedId === id) {
+    state.connected = false
+    updateStatusUI()
+  }
+  renderFleet()
+}
+
+// openDetail enters the classic tabbed view for a server.
+async function openDetail(id) {
+  await selectVPS(id)
 }
 
 async function selectVPS(id) {
@@ -162,8 +652,8 @@ async function selectVPS(id) {
   } catch {
     state.connected = false
   }
-  $('empty-state').classList.add('hidden')
-  $('vps-view').classList.remove('hidden')
+  fleet.conn[id] = state.connected
+  showDetailView()
   $('vps-name').textContent = v.name
   $('vps-host').textContent = v.isLocal ? 'this machine — no SSH' : `${v.user}@${v.host}:${v.port || 22}`
   // Edit/Delete are meaningless for the virtual local entry.
@@ -181,16 +671,19 @@ async function selectVPS(id) {
     if (v.isLocal) {
       try { state.currentDir = await LocalStartDir() } catch { state.currentDir = '/' }
     } else {
-      state.currentDir = '/'
+      // Stacks live under /opt by convention, so the browser opens there;
+      // loadFiles falls back to / on hosts without it.
+      state.currentDir = '/opt'
     }
   }
   // Each (re)selection starts scoped: a project shows its own stack, a plain
   // server shows everything (projectPath null makes the scope a no-op).
   state.dockerShowAll = false
   state.dbShowAll = false
+  state.dockerContainers = []
+  state.dockerFilter = ''
+  $('docker-search').value = ''
   updateStatusUI()
-  renderVPSList()
-  renderProjectList()
   dbResetState()
   if (state.connected) {
     loadCurrentTab()
@@ -222,7 +715,7 @@ function updateStatusUI() {
 // (reusing a live connection) and roots the session at the deploy path.
 async function refreshProjects() {
   try { state.projects = await ListProjects() || [] } catch { state.projects = [] }
-  renderProjectList()
+  if (!$('fleet-proj-menu').classList.contains('hidden')) renderProjectMenu()
 }
 
 // serverLabel describes the server a project points at, for the project row.
@@ -237,41 +730,33 @@ function activeProject() {
   return state.projects.find((p) => p.id === state.activeProjectId) || null
 }
 
-function switchSidebar(side) {
-  state.sidebar = side
-  document.querySelectorAll('.side-btn').forEach((b) => b.classList.toggle('active', b.dataset.side === side))
-  $('vps-list').classList.toggle('hidden', side !== 'servers')
-  $('project-list').classList.toggle('hidden', side !== 'projects')
-  $('add-btn').title = side === 'projects' ? 'Add project' : 'Add server'
-}
-
-function renderProjectList() {
-  const ul = $('project-list')
-  ul.innerHTML = ''
+// The fleet topbar's Projects dropdown. Rows open the project (connects and
+// roots the session at its deploy path); hover reveals edit/delete.
+function renderProjectMenu() {
+  const menu = $('fleet-proj-menu')
+  menu.innerHTML = ''
   if (!state.projects.length) {
-    ul.innerHTML = '<li class="vps-empty muted">No projects yet. Click + to add one.</li>'
+    menu.innerHTML = '<div class="fleet-proj-empty muted">No projects yet — use + Project.</div>'
     return
   }
   for (const p of state.projects) {
-    const li = document.createElement('li')
-    li.className = 'vps-item' + (state.activeProjectId === p.id ? ' active' : '')
-    const isConnected = state.activeProjectId === p.id && state.connected
-    li.innerHTML = `
-      <div class="name-row">
-        <span class="dot ${isConnected ? 'connected' : ''}"></span>
-        <span class="name"></span>
-        <span class="proj-actions"></span>
+    const row = document.createElement('div')
+    row.className = 'fleet-proj-row' + (state.activeProjectId === p.id ? ' active' : '')
+    row.innerHTML = `
+      <div class="fp-main">
+        <span class="fp-name"></span>
+        <span class="fp-server muted"></span>
       </div>
-      <div class="host"></div>
-      <div class="proj-path"></div>
+      <div class="fp-path mono"></div>
+      <div class="proj-actions"></div>
     `
-    li.querySelector('.name').textContent = p.name
-    li.querySelector('.host').textContent = serverLabel(p.vpsId)
-    li.querySelector('.proj-path').textContent = p.path
-    const actions = li.querySelector('.proj-actions')
+    row.querySelector('.fp-name').textContent = p.name
+    row.querySelector('.fp-server').textContent = serverLabel(p.vpsId)
+    row.querySelector('.fp-path').textContent = p.path
+    const actions = row.querySelector('.proj-actions')
     const ed = document.createElement('button')
     ed.textContent = 'Edit'
-    ed.onclick = (e) => { e.stopPropagation(); openProjectModal(p) }
+    ed.onclick = (e) => { e.stopPropagation(); toggleProjectMenu(false); openProjectModal(p) }
     const del = document.createElement('button')
     del.textContent = 'Del'
     del.onclick = async (e) => {
@@ -282,9 +767,16 @@ function renderProjectList() {
       refreshProjects()
     }
     actions.append(ed, del)
-    li.addEventListener('click', () => openProject(p.id))
-    ul.appendChild(li)
+    row.addEventListener('click', () => { toggleProjectMenu(false); openProject(p.id) })
+    menu.appendChild(row)
   }
+}
+
+function toggleProjectMenu(show) {
+  const menu = $('fleet-proj-menu')
+  const want = show ?? menu.classList.contains('hidden')
+  if (want) renderProjectMenu()
+  menu.classList.toggle('hidden', !want)
 }
 
 async function openProject(projectId) {
@@ -380,7 +872,41 @@ async function submitProjectForm(e) {
 }
 
 // ─────────── Connection ───────────
-async function doConnect(trust = false) {
+
+// connectFlow dials a VPS, walking the user through the host-key trust
+// prompts (trust-on-first-use, changed-key warning). Resolves when connected,
+// throws when the user declines or the dial fails. UI-agnostic: both the
+// fleet cards and the detail topbar use it and update their own chrome.
+async function connectFlow(id, trust = false) {
+  const res = await (trust ? TrustHostKey : Connect)(id)
+  // Unknown host key (first connection): show the fingerprint and let the user
+  // decide whether to trust it (trust-on-first-use).
+  if (res && res.needsTrust) {
+    const ok = confirm(
+      `Unknown SSH host key for ${res.host}\n\n` +
+      `${res.keyType} fingerprint:\n${res.fingerprint}\n\n` +
+      `This is the first time connecting to this server. ` +
+      `Verify the fingerprint matches the server, then trust it and continue?`)
+    if (ok) return connectFlow(id, true)
+    throw new Error('Host key not trusted — connection cancelled.')
+  }
+  // Changed host key: a possible man-in-the-middle. Make the user opt in loudly.
+  if (res && res.keyChanged) {
+    const ok = confirm(
+      `⚠ WARNING: the SSH host key for ${res.host} has CHANGED.\n\n` +
+      `New ${res.keyType} fingerprint:\n${res.fingerprint}\n\n` +
+      `This happens if the server was rebuilt — but also if the connection is ` +
+      `being intercepted (man-in-the-middle). Only continue if you KNOW the ` +
+      `server legitimately changed.\n\nForget the old key and trust the new one?`)
+    if (ok) {
+      await ForgetHostKey(id)
+      return connectFlow(id, true)
+    }
+    throw new Error('Host key changed — connection refused.')
+  }
+}
+
+async function doConnect() {
   if (!state.selectedId) return
   const btn = $('connect-btn')
   btn.textContent = 'Connecting…'
@@ -388,35 +914,10 @@ async function doConnect(trust = false) {
   $('status-pill').textContent = 'Connecting'
   $('status-pill').className = 'status-pill connecting'
   try {
-    const res = await (trust ? TrustHostKey : Connect)(state.selectedId)
-    // Unknown host key (first connection): show the fingerprint and let the user
-    // decide whether to trust it (trust-on-first-use).
-    if (res && res.needsTrust) {
-      const ok = confirm(
-        `Unknown SSH host key for ${res.host}\n\n` +
-        `${res.keyType} fingerprint:\n${res.fingerprint}\n\n` +
-        `This is the first time connecting to this server. ` +
-        `Verify the fingerprint matches the server, then trust it and continue?`)
-      if (ok) return doConnect(true)
-      throw new Error('Host key not trusted — connection cancelled.')
-    }
-    // Changed host key: a possible man-in-the-middle. Make the user opt in loudly.
-    if (res && res.keyChanged) {
-      const ok = confirm(
-        `⚠ WARNING: the SSH host key for ${res.host} has CHANGED.\n\n` +
-        `New ${res.keyType} fingerprint:\n${res.fingerprint}\n\n` +
-        `This happens if the server was rebuilt — but also if the connection is ` +
-        `being intercepted (man-in-the-middle). Only continue if you KNOW the ` +
-        `server legitimately changed.\n\nForget the old key and trust the new one?`)
-      if (ok) {
-        await ForgetHostKey(state.selectedId)
-        return doConnect(true)
-      }
-      throw new Error('Host key changed — connection refused.')
-    }
+    await connectFlow(state.selectedId)
     state.connected = true
+    fleet.conn[state.selectedId] = true
     updateStatusUI()
-    renderVPSList()
     loadCurrentTab()
   } catch (e) {
     alert('Connection failed: ' + errMsg(e))
@@ -434,8 +935,10 @@ async function doDisconnect() {
   resetTerminalPanel()
   try { await Disconnect(state.selectedId) } catch {}
   state.connected = false
+  fleet.conn[state.selectedId] = false
+  delete fleet.stats[state.selectedId]
+  delete fleet.containers[state.selectedId]
   updateStatusUI()
-  renderVPSList()
 }
 
 // Restore the terminal panel to its disconnected state.
@@ -480,6 +983,10 @@ function loadCurrentTab() {
     maintenanceOpen()
     return
   }
+  if (state.tab === 'ask') {
+    askOpen()
+    return
+  }
   if (!state.connected) return
   if (state.tab === 'files') {
     if (!state.currentDir) state.currentDir = '/'
@@ -511,6 +1018,12 @@ async function loadFiles(dir) {
     $('files-path').value = dir
     renderFiles(files)
   } catch (e) {
+    // The default start dir is /opt; a host without it lands at / instead of
+    // an error. Deliberate: also applies when /opt is typed by hand.
+    if (dir === '/opt' && !isLocalSel()) {
+      loadFiles('/')
+      return
+    }
     list.innerHTML = `<p class="muted center-msg">Error: ${errMsg(e)}</p>`
   }
 }
@@ -820,17 +1333,29 @@ async function loadContainers() {
       note.textContent = `scoped to ${state.projectPath}`
       note.classList.remove('hidden')
     }
-    renderContainers(containers)
+    state.dockerContainers = containers
+    renderContainers()
   } catch (e) {
+    state.dockerContainers = []
     list.innerHTML = `<p class="muted center-msg">Error: ${errMsg(e)}</p>`
   }
 }
 
-function renderContainers(containers) {
+function renderContainers() {
   const list = $('docker-list')
   list.innerHTML = ''
-  if (!containers.length) {
+  const all = state.dockerContainers
+  if (!all.length) {
     list.innerHTML = '<p class="muted center-msg">No containers found.</p>'
+    return
+  }
+  // Plain case-insensitive substring match on the name, not an exact match.
+  const q = state.dockerFilter.trim().toLowerCase()
+  const containers = q
+    ? all.filter((c) => (c.names || '').toLowerCase().includes(q))
+    : all
+  if (!containers.length) {
+    list.innerHTML = `<p class="muted center-msg">No containers match “${esc(q)}”.</p>`
     return
   }
   for (const c of containers) {
@@ -1352,6 +1877,17 @@ async function deployRefresh() {
   renderDeployList()
 }
 
+// deploySourceLabel describes how a deployment gets its code, since the
+// same repoUrl now drives two different behaviors: cloned onto the target
+// (classic), or cloned+built only locally with just the image published to
+// the target (publish mode) — leaving it ambiguous would misleadingly imply
+// the target sees source when it doesn't.
+function deploySourceLabel(d) {
+  if (!d.repoUrl) return 'existing directory (no git)'
+  const repo = `${d.repoUrl} @ ${d.branch || 'main'}`
+  return d.publishLocalPath ? `${repo} → built & published locally (image only reaches target)` : repo
+}
+
 function renderDeployList() {
   const list = $('deploy-list')
   list.innerHTML = ''
@@ -1382,7 +1918,7 @@ function renderDeployList() {
       st.textContent = status
       st.className = 'deploy-status ' + status
     }
-    card.querySelector('.repo').textContent = `${d.repoUrl} @ ${d.branch || 'main'}`
+    card.querySelector('.repo').textContent = deploySourceLabel(d)
     card.querySelector('.target').textContent = `${vps ? vps.name : '⚠ missing VPS'} : ${d.path}${d.useSudo ? ' · sudo' : ''}`
     const last = card.querySelector('.last')
     if (d.lastDeploy) {
@@ -1443,10 +1979,66 @@ function addEnvRow(key = '', value = '', secret = false) {
   $('deploy-env-rows').appendChild(row)
 }
 
+// parseDotEnv reads .env-format text (KEY=value per line) into {key, value}
+// pairs. Supports '#' full-line comments, blank lines, an optional leading
+// "export ", and single/double-quoted values (double-quoted values unescape
+// \n, \" and \\ same as dotenv/shell); everything else is taken literally so
+// values with '$', '=' or URLs survive untouched.
+function parseDotEnv(text) {
+  const out = []
+  for (const rawLine of text.replace(/\r\n?/g, '\n').split('\n')) {
+    let line = rawLine.trim()
+    if (!line || line.startsWith('#')) continue
+    if (line.startsWith('export ')) line = line.slice('export '.length).trim()
+    const eq = line.indexOf('=')
+    if (eq === -1) continue
+    const key = line.slice(0, eq).trim()
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
+    let value = line.slice(eq + 1).trim()
+    if (value.length >= 2 &&
+      ((value[0] === '"' && value.endsWith('"')) || (value[0] === "'" && value.endsWith("'")))) {
+      const quote = value[0]
+      value = value.slice(1, -1)
+      if (quote === '"') value = value.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+    }
+    out.push({ key, value })
+  }
+  return out
+}
+
+// looksSecret guesses which imported keys are sensitive so they land
+// pre-masked; the checkbox is still there for the user to correct either way.
+function looksSecret(key) {
+  return /SECRET|PASSWORD|PRIVATE|TOKEN|_KEY|APIKEY|CREDENTIAL/i.test(key)
+}
+
+// importEnvRows upserts parsed pairs into the existing row list — a key
+// already present gets its value updated in place, a new key gets a new row —
+// so importing a file composes with vars added by hand instead of wiping them.
+// Returns how many pairs were parsed (0 surfaces as "nothing to import").
+function importEnvRows(text) {
+  const pairs = parseDotEnv(text)
+  const rows = $('deploy-env-rows')
+  for (const { key, value } of pairs) {
+    let matched = null
+    for (const row of rows.children) {
+      if (row.querySelector('.env-key').value.trim() === key) { matched = row; break }
+    }
+    if (matched) {
+      matched.querySelector('.env-value').value = value
+    } else {
+      addEnvRow(key, value, looksSecret(key))
+    }
+  }
+  return pairs.length
+}
+
 function openDeployModal(d = null) {
   const form = $('deploy-form')
   form.reset()
   $('deploy-env-rows').innerHTML = ''
+  $('deploy-env-import-text').value = ''
+  $('deploy-env-import').classList.add('hidden')
   // VPS choices come from the saved list (local included — deploying a repo to
   // this machine is valid).
   const sel = $('deploy-vps')
@@ -1482,6 +2074,13 @@ async function submitDeployForm(e) {
     path: (fd.get('path') || '').trim(),
     composeFile: (fd.get('composeFile') || '').trim(),
     githubToken: fd.get('githubToken') || '',
+    registryHost: (fd.get('registryHost') || '').trim(),
+    registryUsername: (fd.get('registryUsername') || '').trim(),
+    registryToken: fd.get('registryToken') || '',
+    publishLocalPath: (fd.get('publishLocalPath') || '').trim(),
+    publishBuildContext: (fd.get('publishBuildContext') || '').trim(),
+    publishImageRepo: (fd.get('publishImageRepo') || '').trim(),
+    publishImageEnvVar: (fd.get('publishImageEnvVar') || '').trim(),
     useSudo: $('deploy-sudo').checked,
     envVars: [],
   }
@@ -1517,7 +2116,8 @@ async function startDeploy(d) {
   $('deploy-run-view').classList.remove('hidden')
   $('deploy-run-title').textContent = `Deploying ${d.name}`
   const log = $('deploy-log')
-  log.textContent = `⚡ ${d.repoUrl} @ ${d.branch || 'main'} → ${d.path}\n` +
+  const source = deploySourceLabel(d)
+  log.textContent = `⚡ ${source} → ${d.path}\n` +
     (d.useSudo ? '⚡ Sudo: ON\n\n' : '⚡ Sudo: off\n\n')
   const outcome = $('deploy-outcome')
   outcome.classList.add('hidden')
@@ -1715,6 +2315,145 @@ function termPrint(text) {
   $('terminal-placeholder').classList.add('hidden')
   $('terminal').classList.remove('hidden')
   term.inst.write(text.replace(/\r?\n/g, '\r\n'))
+}
+
+// ─────────── Ask (Codex CLI over MCP) ───────────
+// The backend runs one Codex query at a time, global to the app (not keyed
+// per VPS), and streams it through the "ai:log" (one JSON-encoded AIEvent
+// per line) / "ai:done" (error string, "" on success) events. Those
+// subscriptions are registered once at startup, below, since there's only
+// ever one in-flight query to listen for.
+const ask = {
+  running: false,
+  available: null, // resolved lazily, cached across tab visits
+  openTools: new Map(), // tool-call DOM nodes still "in_progress", keyed by a synthetic index
+  toolSeq: 0,
+}
+
+async function askOpen() {
+  if (ask.available === null) {
+    try { ask.available = await AskAIAvailable() } catch { ask.available = false }
+  }
+  $('ask-unavailable').classList.toggle('hidden', ask.available)
+  $('ask-body').classList.toggle('hidden', !ask.available)
+  askAutosize()
+}
+
+function askAutosize() {
+  const ta = $('ask-input')
+  ta.style.height = 'auto'
+  ta.style.height = Math.min(ta.scrollHeight, 140) + 'px'
+}
+
+function askSetRunning(running) {
+  ask.running = running
+  $('ask-send').disabled = running
+  $('ask-stop').classList.toggle('hidden', !running)
+  $('ask-input').disabled = running
+}
+
+// askAppend adds one bubble to the transcript and scrolls it into view.
+// kind: 'user' | 'message' | 'error' | 'status'.
+function askAppend(kind, text) {
+  const t = $('ask-transcript')
+  const el = document.createElement('div')
+  el.className = 'ask-entry ' + kind
+  el.textContent = text
+  t.appendChild(el)
+  t.scrollTop = t.scrollHeight
+  return el
+}
+
+// askAppendTool renders a tool call as a collapsible row (click to see its
+// result/error) that starts amber/"in progress" and settles green/red.
+function askAppendTool(ev) {
+  const t = $('ask-transcript')
+  const wrap = document.createElement('div')
+  wrap.className = 'ask-tool ' + (ev.status || 'in_progress')
+  wrap.innerHTML = `
+    <div class="ask-tool-head">
+      <span class="dot"></span>
+      <span class="name mono"></span>
+    </div>
+    <div class="ask-tool-detail mono"></div>
+  `
+  wrap.querySelector('.name').textContent = ev.tool || 'tool'
+  wrap.querySelector('.ask-tool-detail').textContent = ev.detail || ''
+  wrap.querySelector('.ask-tool-head').addEventListener('click', () => wrap.classList.toggle('open'))
+  t.appendChild(wrap)
+  t.scrollTop = t.scrollHeight
+  const key = ++ask.toolSeq
+  ask.openTools.set(ev.tool + '\x00' + key, wrap)
+  return wrap
+}
+
+// Tool calls arrive as two events (in_progress, then completed/failed) for
+// the SAME call. Since AIEvent carries no call id, match the most recent
+// still-"in_progress" row for that tool name — good enough for the common
+// case (Codex mostly doesn't fire two concurrent calls to the identical
+// tool), and worst case just settles the wrong-but-same-named row instead of
+// leaving one stuck spinning forever.
+function askSettleTool(ev) {
+  for (const [key, node] of ask.openTools) {
+    if (key.startsWith(ev.tool + '\x00') && node.classList.contains('in_progress')) {
+      node.classList.remove('in_progress')
+      node.classList.add(ev.status || 'completed')
+      if (ev.detail) node.querySelector('.ask-tool-detail').textContent = ev.detail
+      ask.openTools.delete(key)
+      return
+    }
+  }
+  // No matching in-progress row (shouldn't normally happen) — render fresh.
+  askAppendTool(ev)
+}
+
+function askHandleEvent(raw) {
+  let ev
+  try { ev = JSON.parse(raw) } catch { return }
+  switch (ev.kind) {
+    case 'message':
+      askAppend('message', ev.text)
+      break
+    case 'error':
+      askAppend('error', '✗ ' + ev.text)
+      break
+    case 'tool_call':
+      if (ev.status === 'in_progress') askAppendTool(ev)
+      else askSettleTool(ev)
+      break
+  }
+}
+
+async function askSend() {
+  if (ask.running || !state.selectedId) return
+  const ta = $('ask-input')
+  const prompt = ta.value.trim()
+  if (!prompt) return
+  askAppend('user', prompt)
+  ta.value = ''
+  askAutosize()
+  ask.openTools.clear()
+  askSetRunning(true)
+
+  ask.logOff = EventsOn('ai:log', askHandleEvent)
+  ask.doneOff = EventsOn('ai:done', (errStr) => {
+    askSetRunning(false)
+    if (errStr) askAppend('error', '✗ ' + errStr)
+    if (ask.logOff) { ask.logOff(); ask.logOff = null }
+    if (ask.doneOff) { ask.doneOff(); ask.doneOff = null }
+  })
+  try {
+    await StartAIQuery(state.selectedId, prompt, $('ask-sudo').checked)
+  } catch (e) {
+    askAppend('error', '✗ ' + errMsg(e))
+    askSetRunning(false)
+    if (ask.logOff) { ask.logOff(); ask.logOff = null }
+    if (ask.doneOff) { ask.doneOff(); ask.doneOff = null }
+  }
+}
+
+async function askStop() {
+  try { await StopAIQuery() } catch {}
 }
 
 // ─────────── Migration ───────────
@@ -2846,16 +3585,24 @@ function toggleAuthFields(type) {
 document.addEventListener('DOMContentLoaded', () => {
   // Load servers before projects: project rows label themselves from the server
   // list, so rendering them first would show "missing server" until reload.
-  refreshVPSList().then(() => refreshProjects())
+  refreshVPSList().then(() => {
+    refreshProjects()
+    startFleetPolling()
+  })
   refreshLocalAvailability()
 
-  // Sidebar: the + button adds whatever the active list shows.
-  $('add-btn').addEventListener('click', () => {
-    if (state.sidebar === 'projects') openProjectModal()
-    else openModal()
+  // Fleet topbar
+  $('fleet-add-server').addEventListener('click', () => openModal())
+  $('fleet-add-project').addEventListener('click', () => openProjectModal())
+  $('fleet-proj-btn').addEventListener('click', (e) => {
+    e.stopPropagation()
+    toggleProjectMenu()
   })
-  document.querySelectorAll('.side-btn').forEach((b) =>
-    b.addEventListener('click', () => switchSidebar(b.dataset.side)))
+  // Any click outside the dropdown closes it.
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.fleet-proj-wrap')) toggleProjectMenu(false)
+  })
+  $('back-to-fleet').addEventListener('click', showFleetView)
 
   // Project modal
   $('project-cancel').addEventListener('click', () => $('project-modal').classList.add('hidden'))
@@ -2899,16 +3646,36 @@ document.addEventListener('DOMContentLoaded', () => {
     const v = state.vpses.find((x) => x.id === state.selectedId)
     if (!confirm(`Delete config for "${v?.name}"?`)) return
     await DeleteVPS(state.selectedId)
+    delete fleet.conn[state.selectedId]
+    delete fleet.stats[state.selectedId]
+    delete fleet.containers[state.selectedId]
+    if (fleet.expandedId === state.selectedId) fleet.expandedId = null
     state.selectedId = null
     state.connected = false
-    $('vps-view').classList.add('hidden')
-    $('empty-state').classList.remove('hidden')
-    refreshVPSList()
+    await refreshVPSList()
+    showFleetView()
   })
 
   // Tabs
   document.querySelectorAll('.tab').forEach((t) => {
     t.addEventListener('click', () => switchTab(t.dataset.tab))
+  })
+
+  // Ask
+  $('ask-send').addEventListener('click', askSend)
+  $('ask-stop').addEventListener('click', askStop)
+  $('ask-input').addEventListener('input', askAutosize)
+  $('ask-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); askSend() }
+  })
+  document.querySelectorAll('.ask-suggestion').forEach((b) => b.addEventListener('click', () => {
+    $('ask-input').value = b.dataset.prompt
+    askAutosize()
+    askSend()
+  }))
+  $('ask-codex-link').addEventListener('click', (e) => {
+    e.preventDefault()
+    BrowserOpenURL('https://github.com/openai/codex')
   })
 
   // Maintenance
@@ -2956,6 +3723,11 @@ document.addEventListener('DOMContentLoaded', () => {
   // Docker
   $('docker-refresh').addEventListener('click', loadContainers)
   $('docker-all').addEventListener('change', (e) => { state.dockerShowAll = e.target.checked; loadContainers() })
+  // Filtering is local to the already-fetched list, so no refetch on keystroke.
+  $('docker-search').addEventListener('input', (e) => {
+    state.dockerFilter = e.target.value
+    renderContainers()
+  })
 
   // Databases
   $('db-refresh').addEventListener('click', dbLoadContainers)
@@ -2992,6 +3764,26 @@ document.addEventListener('DOMContentLoaded', () => {
   $('deploy-cancel').addEventListener('click', () => $('deploy-modal').classList.add('hidden'))
   $('deploy-form').addEventListener('submit', submitDeployForm)
   $('deploy-env-add').addEventListener('click', () => addEnvRow())
+  $('deploy-env-import-toggle').addEventListener('click', () => {
+    $('deploy-env-import').classList.toggle('hidden')
+  })
+  $('deploy-env-import-cancel').addEventListener('click', () => {
+    $('deploy-env-import-text').value = ''
+    $('deploy-env-import').classList.add('hidden')
+  })
+  $('deploy-env-import-choose').addEventListener('click', () => $('deploy-env-import-file').click())
+  $('deploy-env-import-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0]
+    if (!file) return
+    $('deploy-env-import-text').value = await file.text()
+    e.target.value = ''
+  })
+  $('deploy-env-import-apply').addEventListener('click', () => {
+    const n = importEnvRows($('deploy-env-import-text').value)
+    $('deploy-env-import-text').value = ''
+    $('deploy-env-import').classList.add('hidden')
+    if (n === 0) alert('No KEY=value lines found to import.')
+  })
   $('deploy-run-back').addEventListener('click', () => {
     $('deploy-run-view').classList.add('hidden')
     $('deploy-list-view').classList.remove('hidden')

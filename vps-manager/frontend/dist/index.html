@@ -7,42 +7,38 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <script type="module" crossorigin src="/assets/index-BHAqUUf_.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/index-HAOAkVqE.css">
+  <script type="module" crossorigin src="/assets/index-D-YyhyVZ.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-BLJEMz-r.css">
 </head>
 <body>
   <div id="app">
-    <!-- ───── Sidebar: VPS list ───── -->
-    <aside class="sidebar">
-      <div class="sidebar-header">
+    <!-- ───── Fleet: the home view — a canvas of live server cards ───── -->
+    <div id="fleet-view" class="fleet-view">
+      <header class="fleet-topbar">
         <div class="brand">
           <span class="brand-dot"></span>
           <h1>VPS Manager</h1>
         </div>
-        <button id="add-btn" class="btn-icon" title="Add">+</button>
-      </div>
-      <div class="sidebar-switch">
-        <button data-side="servers" class="side-btn active">Servers</button>
-        <button data-side="projects" class="side-btn">Projects</button>
-      </div>
-      <ul id="vps-list" class="vps-list">
-        <li class="vps-empty muted">No servers yet. Click + to add one.</li>
-      </ul>
-      <ul id="project-list" class="vps-list hidden"></ul>
-    </aside>
-
-    <!-- ───── Main panel ───── -->
-    <main class="main">
-      <div id="empty-state" class="empty-state">
-        <div class="empty-inner">
-          <h2>Welcome</h2>
-          <p class="muted">Add a VPS from the sidebar to get started.</p>
+        <div class="fleet-proj-wrap">
+          <button id="fleet-proj-btn" class="fleet-pill">Projects <span class="caret">▾</span></button>
+          <div id="fleet-proj-menu" class="fleet-proj-menu hidden"></div>
         </div>
+        <span class="fleet-spacer"></span>
+        <span class="fleet-hint muted">click a server to see what’s inside · Open for details</span>
+        <button id="fleet-add-project" class="btn btn-secondary">+ Project</button>
+        <button id="fleet-add-server" class="btn">+ Server</button>
+      </header>
+      <div id="fleet-canvas" class="fleet-canvas">
+        <div id="fleet-grid" class="fleet-grid"></div>
       </div>
+    </div>
 
-      <div id="vps-view" class="vps-view hidden">
+    <!-- ───── Main panel (server detail) ───── -->
+    <main class="main hidden" id="main-view">
+      <div id="vps-view" class="vps-view">
         <header class="topbar">
           <div class="topbar-left">
+            <button id="back-to-fleet" class="btn-icon" title="Back to fleet">←</button>
             <h2 id="vps-name"></h2>
             <span id="vps-host" class="mono muted"></span>
             <span id="status-pill" class="status-pill disconnected">Disconnected</span>
@@ -60,6 +56,7 @@
           <button data-tab="docker" class="tab">Docker</button>
           <button data-tab="db" class="tab">Databases</button>
           <button data-tab="terminal" class="tab">Terminal</button>
+          <button data-tab="ask" class="tab">Ask</button>
           <button data-tab="deploy" class="tab">Deploy</button>
           <button data-tab="migration" class="tab">Migration</button>
           <button data-tab="backups" class="tab">Backups</button>
@@ -88,6 +85,7 @@
         <section id="tab-docker" class="tab-panel">
           <div class="docker-toolbar">
             <button id="docker-refresh" class="btn btn-secondary">Refresh</button>
+            <input type="text" id="docker-search" class="path-input docker-search" placeholder="Search containers by name…" autocomplete="off" spellcheck="false" />
             <label class="checkbox-row db-sudo-row hidden" id="docker-scope-row" title="Show every container on the server, not just this project's stack">
               <input type="checkbox" id="docker-all" />
               <span>All containers</span>
@@ -158,6 +156,38 @@
           <div id="terminal" class="terminal hidden"></div>
         </section>
 
+        <!-- Ask tab: natural-language server inspection via Codex CLI over MCP -->
+        <section id="tab-ask" class="tab-panel">
+          <div id="ask-unavailable" class="muted center-msg hidden">
+            <code>codex</code> CLI isn't installed or isn't on PATH. Install it from
+            <a href="#" id="ask-codex-link">github.com/openai/codex</a> and reopen this tab.
+          </div>
+          <div id="ask-body" class="ask-body">
+            <div id="ask-transcript" class="ask-transcript">
+              <div class="ask-intro muted">
+                Ask about this server in plain language — Codex investigates using a handful of
+                read-only Docker tools (images, volumes, containers, disk usage). Nothing is ever
+                deleted or changed; it only looks.
+              </div>
+              <div class="ask-suggestions">
+                <button class="ask-suggestion" data-prompt="Check for redundant images and volumes, and estimate how much disk space could be reclaimed.">Check for redundant images and volumes</button>
+                <button class="ask-suggestion" data-prompt="Summarize Docker's disk usage and flag anything unusually large.">Summarize Docker disk usage</button>
+                <button class="ask-suggestion" data-prompt="List every container, grouped by compose project, and note any that are stopped or restarting.">List containers by compose project</button>
+              </div>
+            </div>
+            <div class="ask-inputrow">
+              <label class="checkbox-row db-sudo-row" title="Run the underlying docker commands with sudo">
+                <input type="checkbox" id="ask-sudo" />
+                <span>sudo</span>
+              </label>
+              <textarea id="ask-input" class="mono" rows="1"
+                placeholder="Check for redundant images and volumes…"></textarea>
+              <button id="ask-stop" class="btn btn-secondary hidden">Stop</button>
+              <button id="ask-send" class="btn">Ask</button>
+            </div>
+          </div>
+        </section>
+
         <!-- Deploy tab -->
         <section id="tab-deploy" class="tab-panel">
           <div id="deploy-list-view" class="deploy-wrap">
@@ -166,7 +196,8 @@
                 <h3 style="margin:0;font-size:15px;">Deployments</h3>
                 <p class="muted" style="font-size:12px;margin:2px 0 0;">
                   Clone a GitHub repo onto a VPS, write a .env from your variables, and run
-                  <code>docker compose up -d --build</code>.
+                  <code>docker compose up -d --build</code> — or leave the repo URL blank to
+                  drive an existing directory (e.g. one your own CI pipeline already deploys) as-is.
                 </p>
               </div>
               <button id="deploy-add" class="btn">+ New deployment</button>
@@ -805,8 +836,8 @@
             <select id="deploy-vps" name="vpsId" required></select>
           </label>
         </div>
-        <label>GitHub repo URL
-          <input type="text" name="repoUrl" required placeholder="https://github.com/owner/repo" class="mono" />
+        <label>GitHub repo URL (optional — blank targets an existing directory as-is with no git/.env changes; set it to also drive "Build & publish" below, which clones/builds locally and never touches the target with source)
+          <input type="text" name="repoUrl" placeholder="https://github.com/owner/repo" class="mono" />
         </label>
         <div class="row" style="grid-template-columns: 1fr 1fr;">
           <label>Branch<input type="text" name="branch" placeholder="main" class="mono" /></label>
@@ -819,8 +850,45 @@
           <input type="password" name="githubToken" placeholder="ghp_… / github_pat_…" />
         </label>
         <div class="deploy-env-head">
+          <span>Container registry (optional — to pull a private pre-built image)</span>
+        </div>
+        <div class="row" style="grid-template-columns: 1.2fr 1fr;">
+          <label>Registry host<input type="text" name="registryHost" placeholder="ghcr.io" class="mono" /></label>
+          <label>Username<input type="text" name="registryUsername" placeholder="owner" class="mono" /></label>
+        </div>
+        <label>Access token
+          <input type="password" name="registryToken" placeholder="a PAT with read:packages (or equivalent pull scope)" />
+        </label>
+        <div class="deploy-env-head">
+          <span>Build &amp; publish (optional — clones + builds the repo above locally, pushes to the registry above, then deploys just that image; the target never receives source)</span>
+        </div>
+        <label>Local build directory (owned by vps-manager — hard-reset every deploy; don't point this at a checkout you edit by hand)
+          <input type="text" name="publishLocalPath" placeholder="C:\vps-manager-builds\my-app" class="mono" />
+        </label>
+        <div class="row" style="grid-template-columns: 1fr 1fr;">
+          <label>Build context (relative to the checkout)<input type="text" name="publishBuildContext" placeholder="." class="mono" /></label>
+          <label>Image repo (no tag)<input type="text" name="publishImageRepo" placeholder="ghcr.io/owner/name" class="mono" /></label>
+        </div>
+        <label>Image env var (passed inline to the target's compose up)
+          <input type="text" name="publishImageEnvVar" placeholder="API_IMAGE" class="mono" />
+        </label>
+        <div class="deploy-env-head">
           <span>Environment variables & secrets</span>
-          <button type="button" id="deploy-env-add" class="btn btn-secondary">+ Add</button>
+          <div class="deploy-env-head-actions">
+            <button type="button" id="deploy-env-import-toggle" class="btn btn-secondary">Import .env</button>
+            <button type="button" id="deploy-env-add" class="btn btn-secondary">+ Add</button>
+          </div>
+        </div>
+        <div id="deploy-env-import" class="deploy-env-import hidden">
+          <textarea id="deploy-env-import-text" class="mono" rows="6"
+            placeholder="KEY=value&#10;ANOTHER_KEY=value2&#10;# comments and blank lines are ignored"></textarea>
+          <div class="deploy-env-import-actions">
+            <input type="file" id="deploy-env-import-file" accept=".env,text/plain" hidden />
+            <button type="button" id="deploy-env-import-choose" class="btn btn-secondary">Choose file…</button>
+            <span class="spacer"></span>
+            <button type="button" id="deploy-env-import-cancel" class="btn btn-secondary">Cancel</button>
+            <button type="button" id="deploy-env-import-apply" class="btn">Import</button>
+          </div>
         </div>
         <div id="deploy-env-rows" class="deploy-env-rows"></div>
         <label class="checkbox-row">

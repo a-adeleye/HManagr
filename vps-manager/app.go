@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -14,6 +19,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"vps-manager/internal/ai"
 	"vps-manager/internal/backup"
 	"vps-manager/internal/caddy"
 	"vps-manager/internal/config"
@@ -24,7 +32,9 @@ import (
 	"vps-manager/internal/maintenance"
 	"vps-manager/internal/migration"
 	"vps-manager/internal/provision"
+	"vps-manager/internal/publish"
 	"vps-manager/internal/sftp"
+	"vps-manager/internal/stats"
 	sshpkg "vps-manager/internal/ssh"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -59,6 +69,13 @@ type App struct {
 	local      *local.Shell
 	localErr   error
 	localReady atomic.Bool
+
+	// aiMu serializes AskAI queries: one Codex run at a time, so the single
+	// Ask tab always shows one coherent conversation rather than interleaved
+	// output from overlapping runs. aiCancel stops the in-flight run, if any.
+	aiMu      sync.Mutex
+	aiRunning bool
+	aiCancel  context.CancelFunc
 }
 
 // LocalID is the reserved VPS id for the virtual "this machine" environment.
@@ -492,6 +509,28 @@ func (a *App) execAsSudoCtx(ctx context.Context, id, cmd string) (*sshpkg.ExecRe
 	return conn.Exec(ctx, "sudo -n "+wrapped)
 }
 
+// execWithStdinAsSudoCtx mirrors execAsSudoCtx but pipes extraStdin to the
+// remote process after the sudo password (if any) — used for `docker login
+// --password-stdin` so the registry token never touches the command line or
+// shell history.
+func (a *App) execWithStdinAsSudoCtx(ctx context.Context, id, cmd, extraStdin string) (*sshpkg.ExecResult, error) {
+	conn, err := a.pool.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	if v, ok := a.store.Get(id); ok && v.User == "root" {
+		return conn.ExecWithStdin(ctx, cmd, extraStdin)
+	}
+	wrapped := "sh -c " + shellQuote(cmd)
+	a.sudoMu.Lock()
+	pwd, hasPwd := a.sudoPasswords[id]
+	a.sudoMu.Unlock()
+	if hasPwd {
+		return conn.ExecWithStdin(ctx, "sudo -S -p '' "+wrapped, pwd+"\n"+extraStdin)
+	}
+	return conn.ExecWithStdin(ctx, "sudo -n "+wrapped, extraStdin)
+}
+
 // execFn returns an exec function that runs commands on the given VPS,
 // optionally wrapped with sudo. The unnamed func type is assignable to
 // migration.ExecFn, db.ExecFn, and deploy.ExecFn alike. The returned function
@@ -518,6 +557,32 @@ func (a *App) execFn(id string, useSudo bool) func(context.Context, string) (*ss
 			return nil, err
 		}
 		return conn.Exec(ctx, cmd)
+	}
+}
+
+// execStdinFn mirrors execFn but for commands that read their own stdin (e.g.
+// `docker login --password-stdin`), so a secret can be piped in rather than
+// passed on the command line. Assignable to deploy.ExecStdinFn.
+func (a *App) execStdinFn(id string, useSudo bool) func(context.Context, string, string) (*sshpkg.ExecResult, error) {
+	if isLocal(id) {
+		return func(ctx context.Context, cmd, stdin string) (*sshpkg.ExecResult, error) {
+			if a.local == nil {
+				return nil, fmt.Errorf("local mode is unavailable on this machine")
+			}
+			return a.local.ExecWithStdin(ctx, cmd, stdin)
+		}
+	}
+	if useSudo {
+		return func(ctx context.Context, cmd, stdin string) (*sshpkg.ExecResult, error) {
+			return a.execWithStdinAsSudoCtx(ctx, id, cmd, stdin)
+		}
+	}
+	return func(ctx context.Context, cmd, stdin string) (*sshpkg.ExecResult, error) {
+		conn, err := a.pool.Get(id)
+		if err != nil {
+			return nil, err
+		}
+		return conn.ExecWithStdin(ctx, cmd, stdin)
 	}
 }
 
@@ -1214,9 +1279,10 @@ func (a *App) ListDeployments() []config.Deployment {
 }
 
 func (a *App) SaveDeployment(d config.Deployment) (config.Deployment, error) {
-	if strings.TrimSpace(d.Name) == "" || strings.TrimSpace(d.RepoURL) == "" ||
-		strings.TrimSpace(d.Path) == "" || d.VPSID == "" {
-		return config.Deployment{}, fmt.Errorf("name, VPS, repo URL and path are required")
+	// RepoURL is intentionally optional — leaving it blank targets a directory
+	// some other system already manages (see deploy.Options.RepoURL doc).
+	if strings.TrimSpace(d.Name) == "" || strings.TrimSpace(d.Path) == "" || d.VPSID == "" {
+		return config.Deployment{}, fmt.Errorf("name, VPS and path are required")
 	}
 	return a.store.SaveDeployment(d)
 }
@@ -1275,6 +1341,14 @@ func (a *App) RunDeploy(deployID string) error {
 			}
 		}
 	}
+	// A build-and-publish phase always runs locally regardless of the deploy
+	// target — connect it up front so a missing Docker Desktop fails fast
+	// instead of partway through the deploy.
+	if d.PublishLocalPath != "" && !isLocal(d.VPSID) {
+		if err := a.connectErr(LocalID); err != nil {
+			return fmt.Errorf("local build phase: %w", err)
+		}
+	}
 
 	exec := a.execFn(d.VPSID, d.UseSudo)
 	stream := a.streamFn(d.VPSID, d.UseSudo)
@@ -1296,15 +1370,52 @@ func (a *App) RunDeploy(deployID string) error {
 		log := func(line string) {
 			wailsruntime.EventsEmit(a.ctx, "deploy:log:"+d.ID, line)
 		}
+
+		// RepoURL/Branch/GithubToken serve the LOCAL build in publish mode —
+		// the target must never see them, so it never tries to clone source
+		// there; only the freshly published image reaches it.
+		targetRepoURL, targetBranch, targetToken := d.RepoURL, d.Branch, d.GithubToken
+		var imageOverride, buildCommit string
+		if d.PublishLocalPath != "" {
+			targetRepoURL, targetBranch, targetToken = "", "", ""
+			ref, commit, err := publish.Run(a.ctx, a.execFn(LocalID, false), a.streamFn(LocalID, false), publish.Options{
+				RepoURL:          d.RepoURL,
+				Branch:           d.Branch,
+				Token:            d.GithubToken,
+				LocalPath:        d.PublishLocalPath,
+				BuildContext:     d.PublishBuildContext,
+				ImageRepo:        d.PublishImageRepo,
+				RegistryHost:     d.RegistryHost,
+				RegistryUsername: d.RegistryUsername,
+				RegistryToken:    d.RegistryToken,
+				ExecStdin:        a.execStdinFn(LocalID, false),
+			}, log)
+			if err != nil {
+				a.store.SetDeployStatus(d.ID, "failed", "", time.Now().Format(time.RFC3339))
+				wailsruntime.EventsEmit(a.ctx, "deploy:done:"+d.ID, err.Error())
+				return
+			}
+			imageOverride, buildCommit = ref, commit
+		}
+
 		commit, err := deploy.Run(a.ctx, exec, stream, deploy.Options{
-			RepoURL:     d.RepoURL,
-			Branch:      d.Branch,
-			Path:        d.Path,
-			ComposeFile: d.ComposeFile,
-			Token:       d.GithubToken,
-			EnvVars:     d.EnvVars,
-			WriteFile:   writeFile,
+			RepoURL:          targetRepoURL,
+			Branch:           targetBranch,
+			Path:             d.Path,
+			ComposeFile:      d.ComposeFile,
+			Token:            targetToken,
+			EnvVars:          d.EnvVars,
+			RegistryHost:     d.RegistryHost,
+			RegistryUsername: d.RegistryUsername,
+			RegistryToken:    d.RegistryToken,
+			ExecStdin:        a.execStdinFn(d.VPSID, d.UseSudo),
+			ImageOverride:    imageOverride,
+			ImageEnvVar:      d.PublishImageEnvVar,
+			WriteFile:        writeFile,
 		}, log)
+		if commit == "" {
+			commit = buildCommit
+		}
 		status, msg := "success", ""
 		if err != nil {
 			status, msg = "failed", err.Error()
@@ -1683,6 +1794,36 @@ func (a *App) SystemLargestImages(id string, limit int, useSudo bool) ([]mainten
 	return maintenance.ListLargestImages(a.ctx, maintenance.ExecFn(a.execFn(id, useSudo)), limit)
 }
 
+// ───────── Fleet stats (live host + container metrics) ─────────
+
+// HostStats returns one live snapshot of a server's vitals (CPU, RAM, disk,
+// load, uptime). Unlike most methods it never auto-connects: the fleet
+// dashboard polls every server on a timer, and a disconnected server must read
+// as offline rather than being silently redialed behind the user's back.
+func (a *App) HostStats(id string) (*stats.Host, error) {
+	if isLocal(id) && !a.localReady.Load() {
+		return nil, fmt.Errorf("the local environment is not connected")
+	}
+	// The probe embeds a 1s sleep between its two CPU samples, so give it
+	// comfortable headroom on a slow link.
+	ctx, cancel := context.WithTimeout(a.ctx, 25*time.Second)
+	defer cancel()
+	return stats.GetHost(ctx, a.execFn(id, false))
+}
+
+// ContainerStats lists the server's containers with live CPU/RAM usage and
+// their compose project/service labels, for the fleet dashboard's expanded
+// card. Same no-auto-connect policy as HostStats.
+func (a *App) ContainerStats(id string) ([]stats.Container, error) {
+	if isLocal(id) && !a.localReady.Load() {
+		return nil, fmt.Errorf("the local environment is not connected")
+	}
+	// `docker stats --no-stream` itself takes a couple of seconds to sample.
+	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+	defer cancel()
+	return stats.GetContainers(ctx, a.execFn(id, false))
+}
+
 // ───────── Database provisioning ─────────
 
 // ProvisionDatabaseEngines returns the static engine catalog for the form.
@@ -1732,4 +1873,285 @@ func (a *App) ExposeServiceDomain(id string, spec caddy.ExposeSpec, useSudo bool
 // never sent to the VPS. proxied toggles Cloudflare's orange-cloud proxying.
 func (a *App) CloudflareUpsert(apiToken, zone, name, ipv4 string, proxied bool) error {
 	return caddy.CloudflareUpsertA(a.ctx, apiToken, zone, name, ipv4, proxied)
+}
+
+// ───────── AI assistant (Codex CLI over MCP) ─────────
+//
+// AskAI lets the user type a free-text request ("check for redundant images
+// and volumes") and hands it to Codex CLI, which reasons over it and decides
+// which tools to call. Codex itself never sees the VPS's SSH credentials —
+// this app starts a short-lived MCP server (internal/ai) bound to the same
+// execFn every other tab uses, gives Codex ONLY that server's tool names, and
+// tears the server down when the query ends. Codex's own auth (its own
+// `codex login`) is untouched and unrelated — this app never reads or stores
+// it. Command OUTPUT (docker listings etc.) does cross to Codex/OpenAI so the
+// model can reason about it, same as if a person pasted terminal output into
+// a chat; that's inherent to the feature and worth the user knowing.
+//
+// Every tool the MCP server exposes is read-only (see internal/ai's package
+// doc) — there is no delete/prune tool. Acting on a finding stays a manual
+// step in the Maintenance/Cleanup tabs.
+
+// AskAIAvailable reports whether the `codex` CLI is on PATH.
+func (a *App) AskAIAvailable() bool {
+	_, err := exec.LookPath("codex")
+	return err == nil
+}
+
+// AIEvent is one line of the Ask tab's transcript, translated from Codex's
+// `--json` event stream into a shape the frontend can render directly:
+// agent messages, tool calls (with their status and truncated result/error),
+// or a rare stray error. Purely-structural envelope types (thread.started,
+// turn.started, turn.completed) carry no user-facing content and are dropped
+// rather than forwarded.
+type AIEvent struct {
+	Kind   string `json:"kind"`             // "message" | "tool_call" | "error"
+	Text   string `json:"text,omitempty"`   // agent_message text, or the error text
+	Tool   string `json:"tool,omitempty"`   // tool_call only
+	Status string `json:"status,omitempty"` // tool_call only: in_progress | completed | failed
+	Detail string `json:"detail,omitempty"` // tool_call only: result/error text, truncated
+}
+
+// codexLine is the subset of Codex's `--json` event shapes this app renders.
+// Item is decoded a second time into codexItem once its own Type is known,
+// since item.started and item.completed share the same envelope but item's
+// shape depends on Item.Type ("agent_message", "mcp_tool_call", "error").
+type codexLine struct {
+	Type    string          `json:"type"` // thread.started | turn.started | item.started | item.completed | error | turn.failed | turn.completed
+	Message string          `json:"message"`
+	Item    json.RawMessage `json:"item"`
+	Error   *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+type codexItem struct {
+	Type   string `json:"type"` // agent_message | mcp_tool_call | error
+	Text   string `json:"text"`
+	Tool   string `json:"tool"`
+	Status string `json:"status"`
+	Result *struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"result"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+	Message string `json:"message"` // item.type == "error"
+}
+
+// parseCodexLine translates one line of Codex's --json stream into an
+// AIEvent, or (nil, false) for lines this UI doesn't surface: structural
+// envelopes, blank lines, and the odd plain-text banner/log line Codex
+// prints to stdout outside the JSONL stream (those fail to parse as JSON and
+// are silently dropped rather than shown as noise).
+func parseCodexLine(line string) (*AIEvent, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" || line[0] != '{' {
+		return nil, false
+	}
+	var cl codexLine
+	if err := json.Unmarshal([]byte(line), &cl); err != nil {
+		return nil, false
+	}
+	switch cl.Type {
+	case "error":
+		return &AIEvent{Kind: "error", Text: cl.Message}, true
+	case "turn.failed":
+		if cl.Error != nil {
+			return &AIEvent{Kind: "error", Text: cl.Error.Message}, true
+		}
+		return &AIEvent{Kind: "error", Text: "the run failed"}, true
+	case "item.started", "item.completed":
+		if len(cl.Item) == 0 {
+			return nil, false
+		}
+		var it codexItem
+		if err := json.Unmarshal(cl.Item, &it); err != nil {
+			return nil, false
+		}
+		switch it.Type {
+		case "agent_message":
+			if it.Text == "" {
+				return nil, false
+			}
+			return &AIEvent{Kind: "message", Text: it.Text}, true
+		case "error":
+			return &AIEvent{Kind: "error", Text: it.Message}, true
+		case "mcp_tool_call":
+			ev := &AIEvent{Kind: "tool_call", Tool: it.Tool, Status: it.Status}
+			switch {
+			case it.Error != nil:
+				ev.Detail = truncate(it.Error.Message, 400)
+			case it.Result != nil && len(it.Result.Content) > 0:
+				ev.Detail = truncate(it.Result.Content[0].Text, 400)
+			}
+			return ev, true
+		}
+	}
+	return nil, false
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+// StartAIQuery runs one Codex query against vpsId's already-authenticated
+// connection and streams the transcript via "ai:log" (JSON-encoded AIEvent)
+// / "ai:done" (error message, "" on success) Wails events. Only one query
+// runs at a time; call StopAIQuery to cancel an in-flight one.
+func (a *App) StartAIQuery(vpsId, prompt string, useSudo bool) error {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return fmt.Errorf("ask something first")
+	}
+	if !a.AskAIAvailable() {
+		return fmt.Errorf("codex CLI isn't installed or isn't on PATH — install it from https://github.com/openai/codex and try again")
+	}
+	if err := a.ensureConnected(vpsId); err != nil {
+		return err
+	}
+
+	a.aiMu.Lock()
+	if a.aiRunning {
+		a.aiMu.Unlock()
+		return fmt.Errorf("a query is already running — stop it or wait for it to finish")
+	}
+	ctx, cancel := context.WithCancel(a.ctx)
+	a.aiRunning = true
+	a.aiCancel = cancel
+	a.aiMu.Unlock()
+
+	// The MCP server is bound to this one query's exec function (fresh each
+	// call — no state shared across queries) and torn down when it ends.
+	srv := ai.NewServer(a.execFn(vpsId, useSudo))
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		a.aiDone(err)
+		return err
+	}
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)
+	httpSrv := &http.Server{Handler: handler}
+	go httpSrv.Serve(lis)
+
+	scratchDir, err := os.MkdirTemp("", "vpsm-ai-*")
+	if err != nil {
+		_ = httpSrv.Close()
+		a.aiDone(err)
+		return err
+	}
+
+	port := lis.Addr().(*net.TCPAddr).Port
+	framed := "You are helping a system administrator inspect ONE remote server through an MCP " +
+		"tool server named 'vpsmanager'. You have no local shell, filesystem or other tools — only " +
+		"vpsmanager's tools (Docker image/volume/container listings, disk usage, and a narrow " +
+		"read-only command runner). Everything you call runs on the remote server, not this " +
+		"machine. Investigate the request below and report findings in plain, concise language; " +
+		"do not propose or attempt to delete/modify anything — this is inspection only.\n\n" +
+		"Request: " + prompt
+
+	// The prompt is piped over stdin ("-") rather than passed as a trailing
+	// argv element: it's arbitrary user text (any quoting, any Unicode, and
+	// framed always embeds a real newline), and Windows command-line
+	// re-quoting through the npm .cmd shim (cmd.exe -> node) has been
+	// observed to mangle a multi-line argument — the model would see nothing
+	// past the first line. Stdin sidesteps command-line escaping entirely.
+	//
+	// Deliberately exec.Command, not exec.CommandContext: "codex" resolves
+	// through that same shim on Windows, forking the real codex.exe as a
+	// child, and CommandContext's automatic kill-on-cancel only reaches the
+	// shim's own PID. killAITree (below) walks the whole tree instead.
+	cmd := exec.Command("codex", "exec",
+		"--json", "--ephemeral", "--skip-git-repo-check",
+		"--sandbox", "read-only",
+		"-C", scratchDir,
+		"-c", fmt.Sprintf(`mcp_servers.vpsmanager.url="http://127.0.0.1:%d/mcp"`, port),
+		"-",
+	)
+	cmd.Stdin = strings.NewReader(framed)
+	hideAIConsole(cmd)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = httpSrv.Close()
+		_ = os.RemoveAll(scratchDir)
+		a.aiDone(err)
+		return err
+	}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		_ = httpSrv.Close()
+		_ = os.RemoveAll(scratchDir)
+		a.aiDone(err)
+		return err
+	}
+
+	// Watches for StopAIQuery's cancel (or app shutdown) and kills the whole
+	// process tree; exits without acting once the run finishes on its own,
+	// signaled by closing done.
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			killAITree(cmd)
+		case <-done:
+		}
+	}()
+
+	go func() {
+		defer func() {
+			close(done)
+			_ = httpSrv.Close()
+			_ = os.RemoveAll(scratchDir)
+		}()
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+		for scanner.Scan() {
+			ev, ok := parseCodexLine(scanner.Text())
+			if !ok {
+				continue
+			}
+			b, _ := json.Marshal(ev)
+			wailsruntime.EventsEmit(a.ctx, "ai:log", string(b))
+		}
+		waitErr := cmd.Wait()
+		msg := ""
+		switch {
+		case ctx.Err() == context.Canceled:
+			msg = "stopped"
+		case waitErr != nil:
+			msg = strings.TrimSpace(stderr.String())
+			if msg == "" {
+				msg = waitErr.Error()
+			}
+		}
+		a.aiDone(nil)
+		wailsruntime.EventsEmit(a.ctx, "ai:done", msg)
+	}()
+	return nil
+}
+
+// aiDone clears the running/cancel state. err is currently unused by callers
+// (the message travels via the ai:done event instead) but kept so early
+// setup failures have an obvious place to route through the same cleanup.
+func (a *App) aiDone(_ error) {
+	a.aiMu.Lock()
+	a.aiRunning = false
+	a.aiCancel = nil
+	a.aiMu.Unlock()
+}
+
+// StopAIQuery cancels the in-flight query, if any; its "ai:done" event still
+// fires (with "stopped").
+func (a *App) StopAIQuery() {
+	a.aiMu.Lock()
+	cancel := a.aiCancel
+	a.aiMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }

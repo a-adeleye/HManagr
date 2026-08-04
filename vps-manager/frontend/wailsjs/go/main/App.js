@@ -6,6 +6,10 @@ export function AddVPS(arg1) {
   return window['go']['main']['App']['AddVPS'](arg1);
 }
 
+export function AskAIAvailable() {
+  return window['go']['main']['App']['AskAIAvailable']();
+}
+
 export function ChmodRemoteFile(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['ChmodRemoteFile'](arg1, arg2, arg3, arg4);
 }
@@ -34,52 +38,20 @@ export function CloseShell(arg1) {
   return window['go']['main']['App']['CloseShell'](arg1);
 }
 
-export function Connect(arg1) {
-  return window['go']['main']['App']['Connect'](arg1);
-}
-
-export function TrustHostKey(arg1) {
-  return window['go']['main']['App']['TrustHostKey'](arg1);
-}
-
-export function ForgetHostKey(arg1) {
-  return window['go']['main']['App']['ForgetHostKey'](arg1);
-}
-
-export function SystemUsage(arg1, arg2) {
-  return window['go']['main']['App']['SystemUsage'](arg1, arg2);
-}
-
-export function PruneDocker(arg1, arg2, arg3) {
-  return window['go']['main']['App']['PruneDocker'](arg1, arg2, arg3);
-}
-
-export function SystemLargestImages(arg1, arg2, arg3) {
-  return window['go']['main']['App']['SystemLargestImages'](arg1, arg2, arg3);
-}
-
-export function ProvisionDatabaseEngines() {
-  return window['go']['main']['App']['ProvisionDatabaseEngines']();
-}
-
-export function ProvisionDatabase(arg1, arg2, arg3) {
-  return window['go']['main']['App']['ProvisionDatabase'](arg1, arg2, arg3);
-}
-
-export function DetectCaddyProxy(arg1, arg2) {
-  return window['go']['main']['App']['DetectCaddyProxy'](arg1, arg2);
-}
-
-export function ExposeServiceDomain(arg1, arg2, arg3) {
-  return window['go']['main']['App']['ExposeServiceDomain'](arg1, arg2, arg3);
-}
-
 export function CloudflareUpsert(arg1, arg2, arg3, arg4, arg5) {
   return window['go']['main']['App']['CloudflareUpsert'](arg1, arg2, arg3, arg4, arg5);
 }
 
+export function Connect(arg1) {
+  return window['go']['main']['App']['Connect'](arg1);
+}
+
 export function ContainerLogs(arg1, arg2, arg3) {
   return window['go']['main']['App']['ContainerLogs'](arg1, arg2, arg3);
+}
+
+export function ContainerStats(arg1) {
+  return window['go']['main']['App']['ContainerStats'](arg1);
 }
 
 export function DBDeleteRow(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
@@ -138,6 +110,10 @@ export function DeleteVPS(arg1) {
   return window['go']['main']['App']['DeleteVPS'](arg1);
 }
 
+export function DetectCaddyProxy(arg1, arg2) {
+  return window['go']['main']['App']['DetectCaddyProxy'](arg1, arg2);
+}
+
 export function Disconnect(arg1) {
   return window['go']['main']['App']['Disconnect'](arg1);
 }
@@ -154,6 +130,10 @@ export function DownloadFile(arg1, arg2, arg3) {
   return window['go']['main']['App']['DownloadFile'](arg1, arg2, arg3);
 }
 
+export function ExposeServiceDomain(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ExposeServiceDomain'](arg1, arg2, arg3);
+}
+
 export function FindComposeFile(arg1, arg2) {
   return window['go']['main']['App']['FindComposeFile'](arg1, arg2);
 }
@@ -162,8 +142,16 @@ export function ForgetBackupSnapshot(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['ForgetBackupSnapshot'](arg1, arg2, arg3, arg4);
 }
 
+export function ForgetHostKey(arg1) {
+  return window['go']['main']['App']['ForgetHostKey'](arg1);
+}
+
 export function HasSudoPassword(arg1) {
   return window['go']['main']['App']['HasSudoPassword'](arg1);
+}
+
+export function HostStats(arg1) {
+  return window['go']['main']['App']['HostStats'](arg1);
 }
 
 export function InspectMigration(arg1, arg2, arg3, arg4, arg5) {
@@ -226,6 +214,18 @@ export function MakeDir(arg1, arg2, arg3) {
   return window['go']['main']['App']['MakeDir'](arg1, arg2, arg3);
 }
 
+export function ProvisionDatabase(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ProvisionDatabase'](arg1, arg2, arg3);
+}
+
+export function ProvisionDatabaseEngines() {
+  return window['go']['main']['App']['ProvisionDatabaseEngines']();
+}
+
+export function PruneDocker(arg1, arg2, arg3) {
+  return window['go']['main']['App']['PruneDocker'](arg1, arg2, arg3);
+}
+
 export function ReadRemoteFile(arg1, arg2) {
   return window['go']['main']['App']['ReadRemoteFile'](arg1, arg2);
 }
@@ -286,6 +286,10 @@ export function SetSudoPassword(arg1, arg2) {
   return window['go']['main']['App']['SetSudoPassword'](arg1, arg2);
 }
 
+export function StartAIQuery(arg1, arg2, arg3) {
+  return window['go']['main']['App']['StartAIQuery'](arg1, arg2, arg3);
+}
+
 export function StartContainer(arg1, arg2) {
   return window['go']['main']['App']['StartContainer'](arg1, arg2);
 }
@@ -298,8 +302,20 @@ export function StatRemoteFile(arg1, arg2) {
   return window['go']['main']['App']['StatRemoteFile'](arg1, arg2);
 }
 
+export function StopAIQuery() {
+  return window['go']['main']['App']['StopAIQuery']();
+}
+
 export function StopContainer(arg1, arg2) {
   return window['go']['main']['App']['StopContainer'](arg1, arg2);
+}
+
+export function SystemLargestImages(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SystemLargestImages'](arg1, arg2, arg3);
+}
+
+export function SystemUsage(arg1, arg2) {
+  return window['go']['main']['App']['SystemUsage'](arg1, arg2);
 }
 
 export function TeardownStack(arg1, arg2, arg3) {
@@ -308,6 +324,10 @@ export function TeardownStack(arg1, arg2, arg3) {
 
 export function TestBackupTarget(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['TestBackupTarget'](arg1, arg2, arg3, arg4);
+}
+
+export function TrustHostKey(arg1) {
+  return window['go']['main']['App']['TrustHostKey'](arg1);
 }
 
 export function UpdateVPS(arg1) {

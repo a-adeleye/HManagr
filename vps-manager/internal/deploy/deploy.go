@@ -9,6 +9,13 @@
 // Private repos authenticate with a GitHub token injected into the https URL
 // for the one transient git command; the on-disk remote is always the clean
 // URL, so the token never persists on the VPS.
+//
+// RepoURL is optional: leaving it blank skips steps 1's git check and all of
+// step 2, so this can also drive a directory some other system already
+// populates and owns (e.g. a CI pipeline that scp's its own compose.yaml and
+// keeps a hand-managed .env there) — vps-manager then just logs into the
+// registry (if configured) and runs compose against whatever's already on
+// disk, without cloning on top of it or requiring an empty directory.
 package deploy
 
 import (
@@ -76,14 +83,42 @@ type ExecFn func(ctx context.Context, cmd string) (*sshpkg.ExecResult, error)
 // Returns the exit code.
 type StreamFn func(ctx context.Context, cmd string, onOutput func(string)) (int, error)
 
+// ExecStdinFn runs a buffered remote command with extraStdin piped to its
+// stdin, e.g. `docker login --password-stdin` — so a registry token never
+// touches the command line, shell history, or process list.
+type ExecStdinFn func(ctx context.Context, cmd, extraStdin string) (*sshpkg.ExecResult, error)
+
 // Options carries everything Run needs; derived from config.Deployment.
 type Options struct {
+	// RepoURL is optional. Blank means "the directory at Path is already
+	// populated by something else" — Run skips git entirely and just brings
+	// up whatever compose file is already there. Branch/Token are ignored
+	// when RepoURL is blank.
 	RepoURL     string
 	Branch      string
 	Path        string
 	ComposeFile string // auto-detected when empty
 	Token       string
 	EnvVars     []config.EnvVar
+
+	// Registry* log the target into a container registry (e.g. ghcr.io)
+	// before `docker compose up`, so compose can pull a private pre-built
+	// image. All three empty skips the login step entirely.
+	RegistryHost     string
+	RegistryUsername string
+	RegistryToken    string
+	// ExecStdin is required when RegistryHost is set; unused otherwise.
+	ExecStdin ExecStdinFn
+
+	// ImageOverride, when set, is passed as an inline env-var override (named
+	// ImageEnvVar, default "API_IMAGE") to `docker compose up` on the
+	// target — e.g. API_IMAGE=ghcr.io/owner/name:sha — so the target pulls
+	// exactly this image without it ever being written into its .env. Set by
+	// the app layer after a local build-and-publish phase (see
+	// internal/publish); never set for a plain clone-and-build-on-target or
+	// pull-existing-directory deploy.
+	ImageOverride string
+	ImageEnvVar   string
 
 	// WriteFile, when set, writes the .env file directly instead of shelling out
 	// to `printf > file`. Local deploys supply this so .env content goes through
@@ -101,30 +136,31 @@ func Run(ctx context.Context, exec ExecFn, stream StreamFn, opts Options, log fu
 		log = func(string) {}
 	}
 	scrub := func(s string) string {
-		if opts.Token == "" {
-			return s
+		if opts.Token != "" {
+			s = strings.ReplaceAll(s, opts.Token, "***")
 		}
-		return strings.ReplaceAll(s, opts.Token, "***")
+		if opts.RegistryToken != "" {
+			s = strings.ReplaceAll(s, opts.RegistryToken, "***")
+		}
+		return s
 	}
 	slog := func(s string) { log(scrub(s)) }
 	fail := func(format string, args ...any) error {
 		return fmt.Errorf("%s", scrub(fmt.Sprintf(format, args...)))
 	}
 
-	branch := opts.Branch
-	if branch == "" {
-		branch = "main"
-	}
-	if opts.Path == "" || opts.RepoURL == "" {
-		return "", fmt.Errorf("repo URL and deploy path are required")
+	if opts.Path == "" {
+		return "", fmt.Errorf("deploy path is required")
 	}
 
-	// 1. Preflight.
+	// 1. Preflight. Git is only needed when we're actually cloning/pulling.
 	slog("→ Checking prerequisites on target…")
-	if res, err := exec(ctx, "command -v git"); err != nil {
-		return "", err
-	} else if res.ExitCode != 0 {
-		return "", fmt.Errorf("git is not installed on the target VPS")
+	if opts.RepoURL != "" {
+		if res, err := exec(ctx, "command -v git"); err != nil {
+			return "", err
+		} else if res.ExitCode != 0 {
+			return "", fmt.Errorf("git is not installed on the target VPS")
+		}
 	}
 	if res, err := exec(ctx, "docker compose version"); err != nil {
 		return "", err
@@ -132,48 +168,65 @@ func Run(ctx context.Context, exec ExecFn, stream StreamFn, opts Options, log fu
 		return "", fail("docker compose is not available: %s", strings.TrimSpace(res.Stderr))
 	}
 
-	authURL := injectToken(opts.RepoURL, opts.Token)
-	cleanURL := cleanRepoURL(opts.RepoURL)
 	dir := shellQuote(opts.Path)
-
-	// 2. Clone or update.
-	res, err := exec(ctx, "test -d "+shellQuote(opts.Path+"/.git"))
-	if err != nil {
-		return "", err
-	}
-	if res.ExitCode == 0 {
-		slog(fmt.Sprintf("→ Updating existing checkout (%s @ %s)…", cleanURL, branch))
-		fetch := fmt.Sprintf("git -C %s fetch --depth 1 %s %s && git -C %s reset --hard FETCH_HEAD",
-			dir, shellQuote(authURL), shellQuote(branch), dir)
-		if res, err := exec(ctx, fetch); err != nil {
-			return "", err
-		} else if res.ExitCode != 0 {
-			return "", fail("git fetch/reset failed: %s", strings.TrimSpace(res.Stderr))
-		}
-	} else {
-		slog(fmt.Sprintf("→ Cloning %s (branch %s) into %s…", cleanURL, branch, opts.Path))
-		if res, err := exec(ctx, "mkdir -p "+shellQuote(path.Dir(opts.Path))); err != nil {
-			return "", err
-		} else if res.ExitCode != 0 {
-			return "", fail("create parent dir: %s", strings.TrimSpace(res.Stderr))
-		}
-		clone := fmt.Sprintf("git clone --depth 1 --branch %s %s %s", shellQuote(branch), shellQuote(authURL), dir)
-		if res, err := exec(ctx, clone); err != nil {
-			return "", err
-		} else if res.ExitCode != 0 {
-			return "", fail("git clone failed: %s", strings.TrimSpace(res.Stderr))
-		}
-		// Never leave the token in the on-disk remote.
-		if res, err := exec(ctx, fmt.Sprintf("git -C %s remote set-url origin %s", dir, shellQuote(cleanURL))); err != nil || res.ExitCode != 0 {
-			slog("  ⚠ couldn't reset remote URL (continuing)")
-		}
-	}
-
-	// 3. Record what we're deploying.
 	commit := ""
-	if res, err := exec(ctx, fmt.Sprintf("git -C %s log -1 --pretty='%%h %%s'", dir)); err == nil && res.ExitCode == 0 {
-		commit = strings.TrimSpace(res.Stdout)
-		slog("  deploying commit: " + commit)
+
+	// 2. Clone or update — skipped entirely when RepoURL is blank, so
+	// vps-manager can also drive a directory it doesn't own (e.g. one a CI
+	// pipeline already populates and keeps its own .env in) without trying to
+	// git-clone on top of it.
+	if opts.RepoURL == "" {
+		if res, err := exec(ctx, "test -d "+dir); err != nil {
+			return "", err
+		} else if res.ExitCode != 0 {
+			return "", fmt.Errorf("%s does not exist on the target — either create it first (e.g. via your existing deploy pipeline) or set a repo URL for vps-manager to clone", opts.Path)
+		}
+		slog("→ No repo URL set — using the existing directory as-is (no git, .env left untouched unless variables are configured below).")
+	} else {
+		branch := opts.Branch
+		if branch == "" {
+			branch = "main"
+		}
+		authURL := injectToken(opts.RepoURL, opts.Token)
+		cleanURL := cleanRepoURL(opts.RepoURL)
+
+		res, err := exec(ctx, "test -d "+shellQuote(opts.Path+"/.git"))
+		if err != nil {
+			return "", err
+		}
+		if res.ExitCode == 0 {
+			slog(fmt.Sprintf("→ Updating existing checkout (%s @ %s)…", cleanURL, branch))
+			fetch := fmt.Sprintf("git -C %s fetch --depth 1 %s %s && git -C %s reset --hard FETCH_HEAD",
+				dir, shellQuote(authURL), shellQuote(branch), dir)
+			if res, err := exec(ctx, fetch); err != nil {
+				return "", err
+			} else if res.ExitCode != 0 {
+				return "", fail("git fetch/reset failed: %s", strings.TrimSpace(res.Stderr))
+			}
+		} else {
+			slog(fmt.Sprintf("→ Cloning %s (branch %s) into %s…", cleanURL, branch, opts.Path))
+			if res, err := exec(ctx, "mkdir -p "+shellQuote(path.Dir(opts.Path))); err != nil {
+				return "", err
+			} else if res.ExitCode != 0 {
+				return "", fail("create parent dir: %s", strings.TrimSpace(res.Stderr))
+			}
+			clone := fmt.Sprintf("git clone --depth 1 --branch %s %s %s", shellQuote(branch), shellQuote(authURL), dir)
+			if res, err := exec(ctx, clone); err != nil {
+				return "", err
+			} else if res.ExitCode != 0 {
+				return "", fail("git clone failed: %s", strings.TrimSpace(res.Stderr))
+			}
+			// Never leave the token in the on-disk remote.
+			if res, err := exec(ctx, fmt.Sprintf("git -C %s remote set-url origin %s", dir, shellQuote(cleanURL))); err != nil || res.ExitCode != 0 {
+				slog("  ⚠ couldn't reset remote URL (continuing)")
+			}
+		}
+
+		// 3. Record what we're deploying.
+		if res, err := exec(ctx, fmt.Sprintf("git -C %s log -1 --pretty='%%h %%s'", dir)); err == nil && res.ExitCode == 0 {
+			commit = strings.TrimSpace(res.Stdout)
+			slog("  deploying commit: " + commit)
+		}
 	}
 
 	// 4. Write .env from configured vars (compose reads it for substitution
@@ -222,10 +275,55 @@ func Run(ctx context.Context, exec ExecFn, stream StreamFn, opts Options, log fu
 				opts.Path, strings.Join(composeCandidates, ", "))
 		}
 	}
-	slog("→ Building and starting stack (docker compose -f " + composeFile + " up -d --build)…")
+	// 5b. Registry login, so compose can pull a private pre-built image
+	// instead of needing a build context on the target. Best-effort logout
+	// once the deploy finishes so the credential doesn't sit in the target's
+	// docker config any longer than the deploy itself.
+	if opts.RegistryHost != "" {
+		if opts.RegistryUsername == "" || opts.RegistryToken == "" {
+			return commit, fmt.Errorf("registry host is set but username or token is missing")
+		}
+		if opts.ExecStdin == nil {
+			return commit, fmt.Errorf("registry login requires stdin support (internal error: ExecStdin not wired)")
+		}
+		slog("→ Logging into " + opts.RegistryHost + "…")
+		login := fmt.Sprintf("docker login %s -u %s --password-stdin", shellQuote(opts.RegistryHost), shellQuote(opts.RegistryUsername))
+		if res, err := opts.ExecStdin(ctx, login, opts.RegistryToken+"\n"); err != nil {
+			return commit, err
+		} else if res.ExitCode != 0 {
+			return commit, fail("docker login failed: %s", strings.TrimSpace(firstNonEmpty(res.Stderr, res.Stdout)))
+		}
+		defer func() {
+			logoutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, _ = exec(logoutCtx, "docker logout "+shellQuote(opts.RegistryHost))
+		}()
+	}
 
-	// 6. Build + up, streamed.
-	up := fmt.Sprintf("cd %s && docker compose -f %s up -d --build --remove-orphans", dir, shellQuote(composeFile))
+	// An image override is passed as an inline env-var assignment ahead of
+	// the compose command — e.g. `API_IMAGE=ghcr.io/owner/name:sha docker
+	// compose ...` — exactly like the CI pipeline does it, so the pulled
+	// image is pinned to precisely what the publish phase just pushed
+	// without writing anything into the target's .env.
+	envPrefix := ""
+	if opts.ImageOverride != "" {
+		envVar := opts.ImageEnvVar
+		if envVar == "" {
+			envVar = "API_IMAGE"
+		}
+		envPrefix = envVar + "=" + shellQuote(opts.ImageOverride) + " "
+		slog(fmt.Sprintf("→ Pinning %s=%s for this deploy…", envVar, opts.ImageOverride))
+	}
+
+	slog("→ Building and starting stack (docker compose -f " + composeFile + " up -d --build --pull always)…")
+
+	// 6. Build + up, streamed. --pull always forces a fresh pull of every
+	// image-only service (registry-backed ones especially) even when a local
+	// image already exists under the same tag — otherwise redeploying a
+	// mutable tag like :latest would silently keep running the stale cached
+	// image. Services with their own build: section are unaffected (nothing
+	// to pull yet — it only refreshes their Dockerfile FROM base layers).
+	up := fmt.Sprintf("cd %s && %sdocker compose -f %s up -d --build --pull always --remove-orphans", dir, envPrefix, shellQuote(composeFile))
 	exit, err := stream(ctx, up, func(chunk string) {
 		log(scrub(strings.TrimRight(chunk, "\n")))
 	})
@@ -397,6 +495,17 @@ func parseComposePS(out string) ([]composePS, bool) {
 		svcs = append(svcs, s)
 	}
 	return svcs, true
+}
+
+// firstNonEmpty returns the first non-blank string, for picking whichever of
+// stderr/stdout actually carries a CLI's error message.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // injectToken embeds a GitHub token into an https clone URL. Non-https URLs

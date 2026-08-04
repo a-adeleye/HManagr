@@ -139,31 +139,30 @@ func (s *Shell) Exec(ctx context.Context, cmd string) (*sshpkg.ExecResult, error
 	return s.run(ctx, cmd, nil)
 }
 
-// ExecWithStdin mirrors ssh.Connection.ExecWithStdin. Locally there is no sudo,
-// so stdin (which over SSH carries the sudo password) is prepended to the
-// script's input — harmless for our command set, none of which reads stdin.
+// ExecWithStdin mirrors ssh.Connection.ExecWithStdin: cmd is expected to read
+// stdin itself at some point (e.g. `docker login --password-stdin`). Locally
+// cmd is fed to bash over its OWN stdin (see the package doc), so a second
+// stdin can't reliably be multiplexed onto that same stream — instead, stdin
+// is written to a private temp file and cmd is run with its stdin redirected
+// from that file, which is removed again before this returns.
 func (s *Shell) ExecWithStdin(ctx context.Context, cmd, stdin string) (*sshpkg.ExecResult, error) {
-	c := exec.CommandContext(ctx, s.bin)
-	hideConsole(c)
-	c.Stdin = strings.NewReader(cmd + "\n")
-	_ = stdin
-	var stdout, stderr bytes.Buffer
-	c.Stdout = &stdout
-	c.Stderr = &stderr
-	err := c.Run()
-	res := &sshpkg.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
-	if ctx.Err() != nil {
-		res.ExitCode = -1
-		return res, ctx.Err()
+	f, err := os.CreateTemp("", "vps-manager-stdin-*")
+	if err != nil {
+		return nil, fmt.Errorf("create stdin temp file: %w", err)
 	}
-	if err == nil {
-		return res, nil
+	path := f.Name()
+	defer os.Remove(path)
+	_, werr := f.WriteString(stdin)
+	cerr := f.Close()
+	if werr != nil {
+		return nil, fmt.Errorf("write stdin temp file: %w", werr)
 	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		res.ExitCode = exitErr.ExitCode()
-		return res, nil
+	if cerr != nil {
+		return nil, fmt.Errorf("write stdin temp file: %w", cerr)
 	}
-	return nil, fmt.Errorf("run shell: %w", err)
+	// Git Bash needs forward slashes even for a Windows-style temp path.
+	quoted := "'" + strings.ReplaceAll(filepath.ToSlash(path), "'", "'\\''") + "'"
+	return s.run(ctx, cmd+" < "+quoted, nil)
 }
 
 // ExecStream mirrors ssh.Connection.ExecStream: combined stdout+stderr is
